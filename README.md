@@ -1,7 +1,8 @@
 # TempMail
 
 一个自托管临时邮件服务平台，支持多域名、用户自助提交域名、MX 自动验证与自动禁用、API Key 鉴权及 Web 管理后台。
-部署教程可看https://linux.do/t/topic/1667604
+部署教程可看 https://linux.do/t/topic/1667604
+
 ---
 
 ## 功能特性
@@ -9,6 +10,10 @@
 | 功能 | 说明 |
 |------|------|
 | 邮箱管理 | 按需创建临时邮箱，可配置 TTL（默认 30 分钟），自动清理 |
+| 邮箱续期 | 到期前一键续期，每次顺延一个有效期，单个邮箱最长存活 24 小时（均可在后台调整）|
+| 到期提醒 | 邮箱剩余不足 5 分钟时弹出提醒，可直接在提醒中续期 |
+| 实时收件 | 收件箱通过 SSE 实时推送新邮件，断线自动回退到轮询 |
+| 验证码识别 | 自动从主题和正文中提取验证码，点击即可复制 |
 | 多域名池 | 多个域名轮流供用户创建邮箱，管理员或普通用户均可提交新域名 |
 | MX 自动验证 | 提交域名后后台每 30 秒轮询 MX 记录，通过即自动激活，无需管理员确认 |
 | 域名健康监控 | 每 6 小时重检已激活域名，MX 失效自动暂停（`status=disabled`）|
@@ -16,7 +21,9 @@
 | API Key 鉴权 | 每用户独立 API Key（`X-API-Key` 头），速率限制 500 次/分钟 |
 | OAuth 登录 | 支持 Linux DO Connect 与 GitHub OAuth 登录，可在后台独立开关 |
 | 管理后台 | Web GUI 管理账户、域名、邮件、系统配置（含 SMTP Hostname）|
-| Dashboard 统计 | 实时展示邮箱数、邮件数、域名数、账户数 |
+| 数据看板 | 配额、即将过期邮箱、最近邮件、域名池概况，自适应铺满宽屏 |
+| API 文档 | 内置完整接口文档，示例代码（cURL / Python / JavaScript）自动填入 Base URL 与当前 Key |
+| 界面 | Vue 3 单页应用，支持浅色 / 深色 / 跟随系统，适配桌面、平板与手机 |
 | 公告系统 | 管理员可设置公告，用户登录后显示 |
 | 速率限制 | Redis 滑动窗口，默认 500 请求/60 秒/令牌 |
 | 连接池 | PgBouncer 事务模式，支持 2000 并发客户端 |
@@ -34,7 +41,7 @@
 ### 1. 克隆并配置
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/123nhh/tempmail.git
 cd tempmail
 cp .env.example .env
 # 编辑 .env，填写 SMTP_SERVER_IP 和 SMTP_HOSTNAME
@@ -43,7 +50,7 @@ cp .env.example .env
 ### 2. 启动服务
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
 六个容器会自动启动：`postgres`、`pgbouncer`、`redis`、`api`、`frontend`（Nginx）、`postfix`。
@@ -65,7 +72,16 @@ docker compose logs api | grep "ADMIN API KEY"
 
 ### 4. 访问 Web 界面
 
-浏览器打开 `http://<服务器IP>`，在登录页输入管理员 API Key 登录。
+浏览器打开 `http://<服务器IP>:8888`（端口由 `FRONTEND_HOST_PORT` 控制），在登录页输入管理员 API Key 登录。
+
+### 从旧版本升级
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+前端改为在镜像构建阶段编译，升级后需要带 `--build` 重新构建。数据库如有未执行的迁移，参考下文「数据库迁移」。
 
 ---
 
@@ -98,6 +114,9 @@ docker compose logs api | grep "ADMIN API KEY"
 | `GITHUB_CLIENT_SECRET` | *(可选)* | GitHub OAuth App 的 Client Secret，也可在后台系统设置中填写 |
 | `GITHUB_REDIRECT_URL` | *(可选)* | GitHub OAuth 回调地址，如 `https://your-domain.com/public/auth/github/callback` |
 | `ADMIN_KEY_FILE` | `/data/admin.key` | 管理员 Key 写入路径（容器内）|
+| `FRONTEND_HOST_PORT` | `8888` | Web 界面映射到宿主机的端口，可写成 `127.0.0.1:8888` 仅本机访问 |
+| `API_HOST_PORT` | `8080` | API 直连端口（Web 界面已经通过 Nginx 反代，无需对外开放）|
+| `SMTP_HOST_PORT` | `25` | SMTP 收件端口，公网收信必须是 25 |
 
 `.env` 示例：
 
@@ -108,6 +127,7 @@ GITHUB_REDIRECT_URL=https://your-domain.com/public/auth/github/callback
 ```
 
 > `SMTP_SERVER_IP` / `SMTP_HOSTNAME` 也可在管理后台「系统设置」中修改，DB 值优先于环境变量。
+> 邮箱有效期相关的后台设置：`mailbox_ttl_minutes`（新邮箱有效期）、`mailbox_extend_minutes`（每次续期时长，留空则等于有效期）、`mailbox_max_lifetime_minutes`（单个邮箱最长存活，默认 1440，`0` 为不限）。
 > GitHub 登录需要在 GitHub OAuth App 中把 Authorization callback URL 设置为 `/public/auth/github/callback` 对应的完整公网地址，并在后台开启「GitHub 登录」。
 
 ### 吞吐压测
@@ -204,22 +224,24 @@ TXT  *      v=spf1 ip4:<服务器公网 IP> ~all
 
 ## API 使用
 
-所有 `/api/*` 请求需在 Header 携带：
+所有 `/api/*` 请求需要携带 API Key，以下三种方式任选其一：
 
 ```
 Authorization: Bearer tm_xxxxxxxxxxxx
+X-API-Key: tm_xxxxxxxxxxxx
+?api_key=tm_xxxxxxxxxxxx
 ```
 
-也兼容 `?api_key=tm_xxxxxxxxxxxx` 查询参数。
+出错时统一返回 `{"error": "..."}`。登录后在 Web 界面的「API 文档」页可以查看全部接口的参数、响应示例和可直接运行的代码。
 
 ### 常用接口
 
 ```bash
-BASE="http://<服务器IP>"
+BASE="http://<服务器IP>:8888"
 KEY="your_api_key"
 
-# 获取可用域名（无需登录）
-curl "$BASE/public/domains"
+# 获取可用域名
+curl "$BASE/api/domains" -H "Authorization: Bearer $KEY"
 
 # 获取公开设置（无需登录）
 curl "$BASE/public/settings"
@@ -247,6 +269,15 @@ curl "$BASE/api/mailboxes" -H "Authorization: Bearer $KEY"
 
 # 读取邮件
 curl "$BASE/api/mailboxes/<mailbox-id>/emails" -H "Authorization: Bearer $KEY"
+
+# 邮箱续期（请求体可省略，默认顺延一个有效期；超过最长存活时间返回 409）
+curl -X POST "$BASE/api/mailboxes/<mailbox-id>/extend" \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"minutes":30}'
+
+# 实时订阅新邮件（SSE）：事件 ready / email / mailbox / expired
+curl -N "$BASE/api/mailboxes/<mailbox-id>/events" -H "Authorization: Bearer $KEY"
 
 # 提交域名（任意登录用户）
 curl -X POST "$BASE/api/domains/submit" \
@@ -315,10 +346,11 @@ tempmail/
 │   ├── middleware/        # 鉴权、速率限制
 │   ├── model/            # 数据结构
 │   └── store/            # 数据库操作
-├── frontend/             # 静态 SPA（Nginx 托管）
-│   ├── index.html
-│   ├── css/style.css
-│   └── js/app.js
+├── frontend/             # Vue 3 + Vite 前端（构建后由 Nginx 托管）
+│   ├── src/views/        # 页面：看板、邮箱、收件箱、域名、API 文档、管理后台
+│   ├── src/components/   # 组件
+│   ├── src/docs/         # API 文档数据源
+│   └── Dockerfile        # 多阶段构建：node 编译 → nginx 托管
 ├── nginx/                # Nginx 反向代理配置
 ├── postfix/              # Postfix 邮件接收
 ├── pgbouncer/            # PgBouncer 连接池配置
@@ -327,6 +359,23 @@ tempmail/
 ├── docker-compose.yml
 └── .env                  # 敏感配置（已 gitignore，不含硬编码 IP）
 ```
+
+---
+
+## 前端开发
+
+前端位于 `frontend/`，使用 Vue 3 + Vite，需 Node.js 20.19+。
+
+```bash
+cd frontend
+npm ci
+npm run dev          # http://localhost:5173，/api 与 /public 代理到 localhost:8080
+# 后端不在本机时：VITE_API_TARGET=http://<服务器IP>:8080 npm run dev
+npm run build        # 产物输出到 frontend/dist
+```
+
+`docker compose up -d --build` 会在镜像构建阶段自动编译前端，无需在宿主机安装 Node.js。
+修改前端代码后需重新执行 `docker compose up -d --build frontend`。
 
 ---
 

@@ -165,13 +165,16 @@ services:
       - internal
 
   # ==================== 前端 Nginx ====================
+  # Vue 前端在镜像构建时编译（frontend/Dockerfile），Nginx 配置仍从宿主机挂载
   frontend:
-    image: nginx:alpine
+    image: tempmail-frontend:local
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
     restart: unless-stopped
     ports:
       - "${FRONTEND_HOST_PORT:-8888}:80"
     volumes:
-      - ./frontend:/usr/share/nginx/html:ro
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - api

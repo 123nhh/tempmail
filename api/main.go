@@ -13,6 +13,8 @@ import (
 	"tempmail/config"
 	"tempmail/handler"
 	"tempmail/middleware"
+	"tempmail/model"
+	"tempmail/realtime"
 	"tempmail/store"
 
 	"github.com/gin-contrib/cors"
@@ -58,6 +60,18 @@ func main() {
 		log.Fatalf("failed to connect redis: %v", err)
 	}
 	defer rdb.Close()
+
+	// 新邮件实时推送（SSE），多实例部署时通过 Redis Pub/Sub 共享事件
+	hub := realtime.NewHub(rdb)
+	go hub.Run(ctx)
+	publishDelivered := func(c *gin.Context, d store.DeliveredEmail, sender, subject string, size int) {
+		if !d.Delivered {
+			return
+		}
+		hub.Publish(c.Request.Context(), d.MailboxID, "email", model.EmailSummary{
+			ID: d.EmailID, Sender: sender, Subject: subject, SizeBytes: size, ReceivedAt: time.Now().UTC(),
+		})
+	}
 	log.Println("[OK] Redis connected")
 
 	// ==================== Gin 路由 ====================
@@ -83,6 +97,7 @@ func main() {
 	accountH := handler.NewAccountHandler(db)
 	domainH := handler.NewDomainHandler(db, cfg.SMTPServerIP, cfg.SMTPHostname)
 	mailboxH := handler.NewMailboxHandler(db)
+	liveH := handler.NewLiveHandler(db, hub)
 	emailH := handler.NewEmailHandler(db)
 	settingH := handler.NewSettingHandler(db)
 	registerH := handler.NewRegisterHandler(db)
@@ -122,6 +137,8 @@ func main() {
 		api.POST("/mailboxes", mailboxH.Create)
 		api.GET("/mailboxes", mailboxH.List)
 		api.DELETE("/mailboxes/:id", mailboxH.Delete)
+		api.POST("/mailboxes/:id/extend", liveH.Extend)
+		api.GET("/mailboxes/:id/events", liveH.Events)
 
 		// 邮件管理
 		api.GET("/mailboxes/:id/emails", emailH.List)
@@ -206,6 +223,7 @@ func main() {
 				c.JSON(http.StatusOK, gin.H{"status": "discarded", "reason": "unknown recipient"})
 				return
 			}
+			publishDelivered(c, delivery, req.Sender, req.Subject, len(req.Raw))
 			c.JSON(http.StatusOK, gin.H{"status": "delivered", "email_id": delivery.EmailID})
 		})
 
@@ -241,6 +259,7 @@ func main() {
 					results = append(results, gin.H{"recipient": delivery.Recipient, "status": "discarded", "reason": "unknown recipient"})
 					continue
 				}
+				publishDelivered(c, delivery, req.Sender, req.Subject, len(req.Raw))
 				results = append(results, gin.H{"recipient": delivery.Recipient, "status": "delivered", "email_id": delivery.EmailID})
 			}
 			c.JSON(http.StatusOK, gin.H{"results": results})
@@ -270,6 +289,13 @@ func main() {
 	log.Println("[OK] Email stats flusher started (interval=1s)")
 
 	// ==================== MX 自动验证轮询 ====================
+	// 与域名接口一致：优先读后台设置 smtp_server_ip，未设置时回退到 SMTP_SERVER_IP 环境变量
+	serverIPForMX := func() string {
+		if ip, err := db.GetSetting(context.Background(), "smtp_server_ip"); err == nil && ip != "" {
+			return ip
+		}
+		return cfg.SMTPServerIP
+	}
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -282,10 +308,7 @@ func main() {
 				log.Printf("[mx-recheck] list active error: %v", err)
 				return
 			}
-			serverIP := cfg.SMTPServerIP
-			if serverIP == "" {
-				serverIP, _ = db.GetSetting(context.Background(), "smtp_server_ip")
-			}
+			serverIP := serverIPForMX()
 			log.Printf("[mx-recheck] checking %d active domains", len(activeDomains))
 			for _, d := range activeDomains {
 				matched, details, mxStatus := store.CheckDomainMXDetails(d.Domain, serverIP)
@@ -314,10 +337,7 @@ func main() {
 				if len(pendingDomains) == 0 {
 					continue
 				}
-				serverIP := cfg.SMTPServerIP
-				if serverIP == "" {
-					serverIP, _ = db.GetSetting(context.Background(), "smtp_server_ip")
-				}
+				serverIP := serverIPForMX()
 				for _, d := range pendingDomains {
 					matched, details, mxStatus := store.CheckDomainMXDetails(d.Domain, serverIP)
 					supportsSingle, supportsWildcard := store.DomainCapabilitiesFromMX(details)

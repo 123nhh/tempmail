@@ -1,0 +1,99 @@
+/* ─── 动效 ───
+ * 统一时长与曲线；base.css 中 prefers-reduced-motion 会把所有动画压到 0.01ms。
+ */
+:root {
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-1: 0.12s;
+  --dur-2: 0.22s;
+  --dur-3: 0.36s;
+}
+
+/* 页面进入：路由切换时 .page 的子元素重新挂载，依次上移淡入 */
+.page > * { animation: rise var(--dur-3) var(--ease-out) both; }
+.page > :nth-child(2) { animation-delay: 40ms; }
+.page > :nth-child(3) { animation-delay: 80ms; }
+.page > :nth-child(4) { animation-delay: 120ms; }
+.page > :nth-child(n + 5) { animation-delay: 160ms; }
+@keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+/* 列表项进出与重排（邮件列表、邮箱表格） */
+.mail-move, .row-move { transition: transform var(--dur-3) var(--ease-out); }
+.mail-enter-active, .row-enter-active { transition: opacity var(--dur-2) var(--ease-out), transform var(--dur-3) var(--ease-out), background 1.2s ease; }
+.mail-leave-active, .row-leave-active { transition: opacity var(--dur-1) ease, transform var(--dur-2) ease; }
+.mail-enter-from { opacity: 0; transform: translateY(-10px); background: color-mix(in oklab, var(--accent) 16%, transparent) !important; }
+.mail-leave-to, .row-leave-to { opacity: 0; transform: translateX(16px); }
+.row-enter-from { opacity: 0; }
+/* 离开时脱离文档流，其余项才能平滑补位 */
+.mail-leave-active { position: absolute; left: 0; right: 0; }
+
+/* 新邮件高亮：插入后背景色缓慢褪去 */
+.flash { animation: flash 1.6s ease-out; }
+@keyframes flash { from { background: color-mix(in oklab, var(--accent) 18%, transparent); } }
+
+/* 按钮按下反馈 */
+.btn, .icon-btn, .otp-chip, .toast-act { transition-property: background, border-color, color, transform, box-shadow; }
+.btn:active:not(:disabled), .icon-btn:active:not(:disabled), button.otp-chip:active { transform: scale(0.97); }
+.btn-primary:hover:not(:disabled) { box-shadow: 0 2px 8px color-mix(in oklab, var(--fill) 30%, transparent); }
+
+/* 卡片悬停（仅可点击卡片） */
+.card.hoverable { transition: border-color var(--ease), box-shadow var(--dur-2) var(--ease-out), transform var(--dur-2) var(--ease-out); }
+.card.hoverable:hover { border-color: color-mix(in oklab, var(--accent) 45%, var(--border)); box-shadow: var(--shadow-pop); transform: translateY(-1px); }
+
+/* 表格行悬停 */
+.tbl tbody tr { transition: background var(--ease); }
+
+/* 导航：激活指示条滑入 */
+.nav.on::before { animation: nav-in var(--dur-2) var(--ease-out); transform-origin: center; }
+@keyframes nav-in { from { transform: scaleY(0); } }
+.nav svg { transition: color var(--ease), transform var(--dur-2) var(--ease-out); }
+.nav:hover svg { transform: translateX(1px); }
+
+/* 提示：从右下弹入，离开时收起 */
+.toast-enter-active { transition: opacity var(--dur-2) var(--ease-out), transform var(--dur-3) var(--ease-out); }
+.toast-leave-active { transition: opacity var(--dur-1) ease, transform var(--dur-2) ease; }
+.toast-enter-from { opacity: 0; transform: translateY(12px) scale(0.96); }
+.toast-leave-to { opacity: 0; transform: translateX(24px); }
+.toast-move { transition: transform var(--dur-2) var(--ease-out); }
+.toast.warn:has(.toast-act) { animation: nudge 0.5s var(--ease-out) 0.3s; }
+@keyframes nudge { 30% { transform: translateX(-3px); } 60% { transform: translateX(2px); } }
+
+/* 弹窗：遮罩淡入，面板缩放弹出 */
+.modal-enter-active, .modal-leave-active { transition: opacity var(--dur-2) ease; }
+.modal-enter-active .modal { transition: transform var(--dur-3) var(--ease-out), opacity var(--dur-2) ease; }
+.modal-leave-active .modal { transition: transform var(--dur-1) ease, opacity var(--dur-1) ease; }
+.modal-enter-from .modal { transform: translateY(12px) scale(0.97); opacity: 0; }
+.modal-leave-to .modal { transform: scale(0.98); opacity: 0; }
+
+/* 进度条：宽度与颜色都平滑过渡（续期时会回弹） */
+.bar > i { transition: width 0.6s var(--ease-out), background var(--dur-3) ease; }
+
+/* 剩余时间紧张时的呼吸提示 */
+.bar.bad > i { animation: breathe 1.6s ease-in-out infinite; }
+@keyframes breathe { 50% { opacity: 0.55; } }
+
+/* 续期成功：剩余时间一闪 */
+.ttl-renewed { animation: renewed 0.9s var(--ease-out); border-radius: var(--r-xs); }
+@keyframes renewed {
+  0% { background: color-mix(in oklab, var(--ok) 28%, transparent); transform: scale(1.04); }
+  100% { background: transparent; transform: none; }
+}
+
+/* 骨架屏 → 内容 */
+.fade-enter-active { transition: opacity var(--dur-2) ease; }
+.fade-leave-active { transition: opacity var(--dur-1) ease; }
+.fade-enter-from, .fade-leave-to { opacity: 0; }
+
+/* 空状态图标轻浮动 */
+.empty .ico { animation: float 3.2s ease-in-out infinite; }
+@keyframes float { 50% { transform: translateY(-3px); } }
+
+/* 复制成功：图标弹跳 */
+.copied svg { animation: pop 0.35s var(--ease-out); }
+@keyframes pop { 40% { transform: scale(1.25); } }
+
+/* 输入框聚焦光晕 */
+.inp { transition: border-color var(--ease), box-shadow var(--dur-2) var(--ease-out); }
+
+/* 移动端侧栏抽屉 */
+.side { transition: transform var(--dur-3) var(--ease-out), box-shadow var(--dur-3) ease; }

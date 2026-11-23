@@ -26,7 +26,7 @@ type Config struct {
 	RedisPassword        string
 	RateLimit            int
 	RateWindow           int    // seconds
-	SMTPServerIP         string // 仅从 SMTP_SERVER_IP 环境变量读取
+	SMTPServerIP         string // SMTP_SERVER_IP 环境变量，仅在后台未设置 smtp_server_ip 时作为回退
 	SMTPHostname         string // 邮件服务器场指向的 hostname，不硬编码
 	LinuxDOClientID      string
 	LinuxDOClientSecret  string

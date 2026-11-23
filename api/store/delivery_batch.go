@@ -31,7 +31,7 @@ func (s *Store) DeliverMessage(ctx context.Context, delivery MessageDelivery) (D
 	if validationErr := validateMessageDelivery(delivery); validationErr != nil {
 		var exists bool
 		if err := s.pool.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM mailboxes WHERE full_address = $1)`,
+			`SELECT EXISTS (SELECT 1 FROM mailboxes WHERE full_address = $1 AND expires_at > NOW())`,
 			strings.ToLower(delivery.Recipient),
 		).Scan(&exists); err != nil {
 			return DeliveredEmail{}, err
@@ -112,7 +112,7 @@ func (s *Store) DeliverMessageBatch(ctx context.Context, deliveries []MessageDel
 				m.id AS mailbox_id,
 				gen_random_uuid() AS email_id
 			FROM input AS i
-			JOIN mailboxes AS m ON m.full_address = lower(i.recipient)
+			JOIN mailboxes AS m ON m.full_address = lower(i.recipient) AND m.expires_at > NOW()
 		),
 		inserted AS (
 			INSERT INTO emails (

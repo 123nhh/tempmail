@@ -611,14 +611,14 @@ func (s *Store) CreateMailbox(ctx context.Context, accountID uuid.UUID, address 
 func (s *Store) ListMailboxes(ctx context.Context, accountID uuid.UUID, page, size int) ([]model.Mailbox, int, error) {
 	var total int
 	err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM mailboxes WHERE account_id = $1`, accountID).Scan(&total)
+		`SELECT COUNT(*) FROM mailboxes WHERE account_id = $1 AND expires_at > NOW()`, accountID).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
 
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, account_id, address, domain_id, full_address, created_at, expires_at
-		 FROM mailboxes WHERE account_id = $1
+		 FROM mailboxes WHERE account_id = $1 AND expires_at > NOW()
 		 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
 		accountID, size, (page-1)*size,
 	)
@@ -638,7 +638,7 @@ func (s *Store) GetMailbox(ctx context.Context, mailboxID uuid.UUID, accountID u
 	var m model.Mailbox
 	err := s.pool.QueryRow(ctx,
 		`SELECT id, account_id, address, domain_id, full_address, created_at, expires_at
-		 FROM mailboxes WHERE id = $1 AND account_id = $2`,
+		 FROM mailboxes WHERE id = $1 AND account_id = $2 AND expires_at > NOW()`,
 		mailboxID, accountID,
 	).Scan(&m.ID, &m.AccountID, &m.Address, &m.DomainID, &m.FullAddress, &m.CreatedAt, &m.ExpiresAt)
 	if err != nil {
@@ -663,13 +663,44 @@ func (s *Store) GetMailboxByFullAddress(ctx context.Context, fullAddress string)
 	var m model.Mailbox
 	err := s.pool.QueryRow(ctx,
 		`SELECT id, account_id, address, domain_id, full_address, created_at, expires_at
-		 FROM mailboxes WHERE full_address = $1`,
+		 FROM mailboxes WHERE full_address = $1 AND expires_at > NOW()`,
 		strings.ToLower(fullAddress),
 	).Scan(&m.ID, &m.AccountID, &m.Address, &m.DomainID, &m.FullAddress, &m.CreatedAt, &m.ExpiresAt)
 	if err != nil {
 		return nil, err
 	}
 	return &m, nil
+}
+
+// ErrExtendLimitReached 表示邮箱已达到最长存活时间，不能再续期。
+var ErrExtendLimitReached = errors.New("mailbox lifetime limit reached")
+
+// ExtendMailbox 把未过期邮箱的到期时间顺延 extendMinutes 分钟，
+// 但不超过 created_at + maxLifetimeMinutes（<=0 表示不限）。已过期或不存在返回 pgx.ErrNoRows。
+func (s *Store) ExtendMailbox(ctx context.Context, mailboxID, accountID uuid.UUID, extendMinutes, maxLifetimeMinutes int) (*model.Mailbox, error) {
+	var m model.Mailbox
+	err := s.pool.QueryRow(ctx,
+		`UPDATE mailboxes
+		 SET expires_at = CASE
+		       WHEN $4::INT > 0 THEN LEAST(expires_at + make_interval(mins => $3::INT), created_at + make_interval(mins => $4::INT))
+		       ELSE expires_at + make_interval(mins => $3::INT)
+		     END
+		 WHERE id = $1 AND account_id = $2 AND expires_at > NOW()
+		   AND ($4::INT <= 0 OR expires_at < created_at + make_interval(mins => $4::INT))
+		 RETURNING id, account_id, address, domain_id, full_address, created_at, expires_at`,
+		mailboxID, accountID, extendMinutes, maxLifetimeMinutes,
+	).Scan(&m.ID, &m.AccountID, &m.Address, &m.DomainID, &m.FullAddress, &m.CreatedAt, &m.ExpiresAt)
+	if err == nil {
+		return &m, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+	// 区分“已到上限”和“不存在/已过期”
+	if _, getErr := s.GetMailbox(ctx, mailboxID, accountID); getErr == nil {
+		return nil, ErrExtendLimitReached
+	}
+	return nil, pgx.ErrNoRows
 }
 
 // DeleteExpiredMailboxes 刪除已过期的邮箱（及其所有邮件）
@@ -847,7 +878,7 @@ func (s *Store) DeliverEmails(ctx context.Context, recipients []string, sender, 
 				m.id AS mailbox_id,
 				gen_random_uuid() AS email_id
 			FROM input AS i
-			JOIN mailboxes AS m ON m.full_address = lower(i.recipient)
+			JOIN mailboxes AS m ON m.full_address = lower(i.recipient) AND m.expires_at > NOW()
 		),
 		inserted AS (
 			INSERT INTO emails (id, mailbox_id, sender, subject, body_text, body_html, raw_message, size_bytes)

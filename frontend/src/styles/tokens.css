@@ -1,0 +1,76 @@
+/* ============================================================
+   TempMail 设计令牌 · 灰杏（低饱和浅暖色）
+   取值与 design/palette.html 中选定方案一致
+   ============================================================ */
+
+:root {
+  --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Noto Sans SC", "Segoe UI", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+
+  --side-w: 232px;
+  --ease: 0.15s ease;
+
+  /* 品牌 · 灰杏 */
+  --fill: #E0C4B0;
+  --on-fill: #3F2C22;
+  --accent: #8A6149;
+  --fill-edge: #AD866E;
+
+  /* 暖灰中性色 */
+  --bg: #FAFAF9;
+  --surface: #FFFFFF;
+  --border: #E7E5E4;
+  --text: #1C1917;
+  --text-2: #57534E;
+  --text-3: #78716C;
+
+  /* 状态色（始终配图标 + 文字） */
+  --ok: #436B4E;
+  --ok-bg: #EEF3EE;
+  --warn: #8A6420;
+  --warn-bg: #F6EEDD;
+  --bad: #A3473B;
+  --bad-bg: #F6E7E3;
+
+  --shadow-pop: 0 12px 32px rgba(28, 25, 23, 0.12), 0 2px 6px rgba(28, 25, 23, 0.06);
+  --overlay: rgba(28, 25, 23, 0.36);
+
+  --tint: color-mix(in oklab, var(--fill) 32%, var(--surface));
+  --tint-strong: color-mix(in oklab, var(--fill) 60%, var(--surface));
+
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  --fill: #D2B39D;
+  --on-fill: #1C1917;
+  --accent: #D2B39D;
+  --fill-edge: #D2B39D;
+
+  --bg: #0C0A09;
+  --surface: #1C1917;
+  --border: #3A3431;
+  --text: #FAFAF9;
+  --text-2: #A8A29E;
+  --text-3: #8A837D;
+
+  --ok: #9CC5A5;
+  --ok-bg: #1F2A22;
+  --warn: #D9B774;
+  --warn-bg: #2D2618;
+  --bad: #E39A8F;
+  --bad-bg: #2F1E1B;
+
+  --shadow-pop: 0 16px 40px rgba(0, 0, 0, 0.5);
+  --overlay: rgba(0, 0, 0, 0.6);
+
+  --tint: color-mix(in oklab, var(--fill) 14%, var(--surface));
+  --tint-strong: color-mix(in oklab, var(--fill) 26%, var(--surface));
+
+  color-scheme: dark;
+}

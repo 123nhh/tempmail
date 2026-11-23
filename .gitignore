@@ -17,3 +17,8 @@ api/*.exe
 # OS
 .DS_Store
 Thumbs.db
+
+# 本地资料，不入库
+docs/copyright/
+frontend-legacy/
+design/
