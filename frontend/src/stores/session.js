@@ -47,10 +47,10 @@ export const useSession = defineStore('session', {
       if (this.settingsLoaded && !force) return this.settings
       try {
         this.settings = (await api.publicSettings()) || {}
+        this.settingsLoaded = true
       } catch {
         this.settings = this.settings || {}
       }
-      this.settingsLoaded = true
       return this.settings
     },
     // API Key 登录（受“API Key 登录”开关控制）

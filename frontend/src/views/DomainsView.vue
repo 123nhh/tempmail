@@ -35,7 +35,7 @@ async function load() {
   }
 }
 
-// 每 5 秒检查待验证域名，激活后移入域名池
+// 每 30 秒检查待验证域名（与后台检测周期一致），激活后移入域名池
 usePoller(async () => {
   if (!pending.value.length) return
   const results = await Promise.all(pending.value.map(d => api.getDomainStatus(d.id).catch(() => null)))
@@ -49,7 +49,7 @@ usePoller(async () => {
     }
   })
   if (changed) await load()
-}, 5000)
+}, 30000)
 
 onMounted(load)
 </script>

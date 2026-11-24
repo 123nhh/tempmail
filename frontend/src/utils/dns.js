@@ -4,7 +4,7 @@ export function normalizeDomain(domain) {
   return String(domain || '').trim().toLowerCase().replace(/\.$/, '')
 }
 
-export function domainBase(domain) {
+function domainBase(domain) {
   const d = normalizeDomain(domain)
   return d.startsWith('*.') ? d.slice(2) : d
 }

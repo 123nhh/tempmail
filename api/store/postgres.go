@@ -96,7 +96,16 @@ const (
 	DomainCapabilityWildcard = "wildcard"
 )
 
-var domainLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+var (
+	domainLabelPattern     = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	ErrCannotDeleteAdmin   = errors.New("cannot delete admin account")
+	ErrDomainDisabled      = errors.New("domain is disabled by admin")
+	ErrPendingDomainsLimit = errors.New("pending domain limit reached")
+	ErrDomainNoCapability  = errors.New("domain has no verified MX capability")
+	ErrMailboxLimitReached = errors.New("mailbox quota limit reached")
+)
+
+const dnsLookupTimeout = 4 * time.Second
 
 type DomainInUseError struct {
 	MailboxCount int
@@ -104,11 +113,6 @@ type DomainInUseError struct {
 
 func (e *DomainInUseError) Error() string {
 	return fmt.Sprintf("domain is used by %d mailbox(es)", e.MailboxCount)
-}
-
-// New 创建带连接池的 Store（高并发核心）
-func New(ctx context.Context, dsn string) (*Store, error) {
-	return NewWithOptions(ctx, dsn, PoolOptions{})
 }
 
 func NewWithOptions(ctx context.Context, dsn string, options PoolOptions) (*Store, error) {
@@ -247,8 +251,23 @@ func (s *Store) CreateAccount(ctx context.Context, username string) (*model.Acco
 }
 
 func (s *Store) DeleteAccount(ctx context.Context, accountID uuid.UUID) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM accounts WHERE id = $1`, accountID)
-	return err
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var isAdmin bool
+	if err := tx.QueryRow(ctx, `SELECT is_admin FROM accounts WHERE id = $1 FOR UPDATE`, accountID).Scan(&isAdmin); err != nil {
+		return err
+	}
+	if isAdmin {
+		return ErrCannotDeleteAdmin
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM accounts WHERE id = $1`, accountID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) ListAccounts(ctx context.Context, page, size int) ([]model.AccountWithStats, int, error) {
@@ -315,7 +334,7 @@ func (s *Store) AddDomain(ctx context.Context, domain string) (*model.Domain, er
 func (s *Store) AddDomainWithCapabilities(ctx context.Context, domain string, supportsSingle, supportsWildcard bool) (*model.Domain, error) {
 	_, domainType, baseDomain := NormalizeDomain(domain)
 	canonicalDomain := baseDomain
-	if existing, err := s.GetDomainByName(ctx, baseDomain); err == nil {
+	if existing, err := s.GetDomainByAnyName(ctx, baseDomain); err == nil {
 		canonicalDomain = existing.Domain
 	}
 	if supportsWildcard {
@@ -347,31 +366,134 @@ func (s *Store) AddDomainWithCapabilities(ctx context.Context, domain string, su
 	return &d, nil
 }
 
-// AddDomainPending 添加待验证域名（后台轮询 MX 记录）
-func (s *Store) AddDomainPending(ctx context.Context, domain string) (*model.Domain, error) {
+// SubmitDomain 在单事务内原子保存用户或管理员提交的域名，防止并发覆写管理员停用态或绕过待验证队列上限。
+func (s *Store) SubmitDomain(ctx context.Context, domain string, matched, supportsSingle, supportsWildcard, allowReactivate bool, maxPending int) (*model.Domain, error) {
 	canonicalDomain, domainType, baseDomain := NormalizeDomain(domain)
-	var d model.Domain
-	err := s.pool.QueryRow(ctx,
-		`INSERT INTO domains (domain, domain_type, base_domain, supports_single, supports_wildcard, is_active, status)
-		 VALUES ($1, $2, $3, FALSE, FALSE, FALSE, 'pending')
-		 ON CONFLICT (domain) DO UPDATE
-		   SET status = CASE WHEN domains.is_active THEN 'active' ELSE 'pending' END,
-		       is_active = domains.is_active,
-		       domain_type = EXCLUDED.domain_type,
-		       base_domain = EXCLUDED.base_domain
-		 RETURNING id, domain, domain_type, base_domain, supports_single, supports_wildcard, is_active, status, created_at, mx_checked_at`,
-		canonicalDomain, domainType, baseDomain,
-	).Scan(&d.ID, &d.Domain, &d.DomainType, &d.BaseDomain, &d.SupportsSingle, &d.SupportsWildcard, &d.IsActive, &d.Status, &d.CreatedAt, &d.MxCheckedAt)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &d, nil
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var existing model.Domain
+	err = tx.QueryRow(ctx,
+		`SELECT id, domain, domain_type, base_domain, supports_single, supports_wildcard, is_active, status, created_at, mx_checked_at
+		 FROM domains
+		 WHERE domain = $1 OR base_domain = $2
+		 ORDER BY CASE WHEN domain = $1 THEN 0 ELSE 1 END, id
+		 LIMIT 1
+		 FOR UPDATE`,
+		canonicalDomain, baseDomain,
+	).Scan(&existing.ID, &existing.Domain, &existing.DomainType, &existing.BaseDomain, &existing.SupportsSingle, &existing.SupportsWildcard, &existing.IsActive, &existing.Status, &existing.CreatedAt, &existing.MxCheckedAt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+
+	if err == nil {
+		if existing.Status == "disabled" && !allowReactivate {
+			return nil, ErrDomainDisabled
+		}
+		if matched {
+			newType := DomainTypeExact
+			if supportsWildcard {
+				newType = DomainTypeWildcard
+			}
+			var updated model.Domain
+			if err := tx.QueryRow(ctx,
+				`UPDATE domains
+				 SET domain_type = $1,
+				     base_domain = $2,
+				     supports_single = $3,
+				     supports_wildcard = $4,
+				     is_active = TRUE,
+				     status = 'active',
+				     mx_checked_at = NOW()
+				 WHERE id = $5
+				 RETURNING id, domain, domain_type, base_domain, supports_single, supports_wildcard, is_active, status, created_at, mx_checked_at`,
+				newType, baseDomain, supportsSingle, supportsWildcard, existing.ID,
+			).Scan(&updated.ID, &updated.Domain, &updated.DomainType, &updated.BaseDomain, &updated.SupportsSingle, &updated.SupportsWildcard, &updated.IsActive, &updated.Status, &updated.CreatedAt, &updated.MxCheckedAt); err != nil {
+				return nil, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return nil, err
+			}
+			return &updated, nil
+		}
+		if existing.Status == "disabled" && allowReactivate {
+			var updated model.Domain
+			if err := tx.QueryRow(ctx,
+				`UPDATE domains
+				 SET is_active = FALSE,
+				     status = 'pending'
+				 WHERE id = $1
+				 RETURNING id, domain, domain_type, base_domain, supports_single, supports_wildcard, is_active, status, created_at, mx_checked_at`,
+				existing.ID,
+			).Scan(&updated.ID, &updated.Domain, &updated.DomainType, &updated.BaseDomain, &updated.SupportsSingle, &updated.SupportsWildcard, &updated.IsActive, &updated.Status, &updated.CreatedAt, &updated.MxCheckedAt); err != nil {
+				return nil, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return nil, err
+			}
+			return &updated, nil
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return &existing, nil
+	}
+
+	if matched {
+		newType := domainType
+		if supportsWildcard {
+			newType = DomainTypeWildcard
+		}
+		var created model.Domain
+		if err := tx.QueryRow(ctx,
+			`INSERT INTO domains (domain, domain_type, base_domain, supports_single, supports_wildcard, is_active, status, mx_checked_at)
+			 VALUES ($1, $2, $3, $4, $5, TRUE, 'active', NOW())
+			 RETURNING id, domain, domain_type, base_domain, supports_single, supports_wildcard, is_active, status, created_at, mx_checked_at`,
+			baseDomain, newType, baseDomain, supportsSingle, supportsWildcard,
+		).Scan(&created.ID, &created.Domain, &created.DomainType, &created.BaseDomain, &created.SupportsSingle, &created.SupportsWildcard, &created.IsActive, &created.Status, &created.CreatedAt, &created.MxCheckedAt); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return &created, nil
+	}
+
+	if !allowReactivate && maxPending > 0 {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('domains_pending_submit'))`); err != nil {
+			return nil, err
+		}
+		var pendingCount int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM domains WHERE status = 'pending'`).Scan(&pendingCount); err != nil {
+			return nil, err
+		}
+		if pendingCount >= maxPending {
+			return nil, ErrPendingDomainsLimit
+		}
+	}
+
+	var created model.Domain
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO domains (domain, domain_type, base_domain, supports_single, supports_wildcard, is_active, status)
+		 VALUES ($1, $2, $3, FALSE, FALSE, FALSE, 'pending')
+		 RETURNING id, domain, domain_type, base_domain, supports_single, supports_wildcard, is_active, status, created_at, mx_checked_at`,
+		canonicalDomain, domainType, baseDomain,
+	).Scan(&created.ID, &created.Domain, &created.DomainType, &created.BaseDomain, &created.SupportsSingle, &created.SupportsWildcard, &created.IsActive, &created.Status, &created.CreatedAt, &created.MxCheckedAt); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &created, nil
 }
 
 func (s *Store) ListDomains(ctx context.Context) ([]model.Domain, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, domain, domain_type, base_domain, supports_single, supports_wildcard, is_active, status, created_at, mx_checked_at
-		 FROM domains ORDER BY created_at`)
+		 FROM domains ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -388,30 +510,6 @@ func (s *Store) GetActiveDomains(ctx context.Context) ([]model.Domain, error) {
 	}
 	defer rows.Close()
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[model.Domain])
-}
-
-func (s *Store) GetRandomActiveDomain(ctx context.Context) (*model.Domain, error) {
-	return s.GetRandomActiveDomainByCapability(ctx, DomainCapabilitySingle)
-}
-
-func (s *Store) GetRandomActiveDomainByType(ctx context.Context, domainType string) (*model.Domain, error) {
-	if domainType == DomainTypeWildcard {
-		return s.GetRandomActiveDomainByCapability(ctx, DomainCapabilityWildcard)
-	}
-	if domainType == DomainTypeExact {
-		return s.GetRandomActiveDomainByCapability(ctx, DomainCapabilitySingle)
-	}
-	var d model.Domain
-	err := s.pool.QueryRow(ctx,
-		`SELECT id, domain, domain_type, base_domain, supports_single, supports_wildcard, is_active, status, created_at, mx_checked_at
-		 FROM domains WHERE is_active = TRUE AND domain_type = $1
-		 ORDER BY RANDOM() LIMIT 1`,
-		domainType,
-	).Scan(&d.ID, &d.Domain, &d.DomainType, &d.BaseDomain, &d.SupportsSingle, &d.SupportsWildcard, &d.IsActive, &d.Status, &d.CreatedAt, &d.MxCheckedAt)
-	if err != nil {
-		return nil, err
-	}
-	return &d, nil
 }
 
 func (s *Store) GetRandomActiveDomainByCapability(ctx context.Context, capability string) (*model.Domain, error) {
@@ -431,7 +529,7 @@ func (s *Store) GetRandomActiveDomainByCapability(ctx context.Context, capabilit
 	return &d, nil
 }
 
-// GetDomainByName 按域名字符串查找活跃域名，供创建邮箱时指定域名使用
+// GetDomainByName 按域名字符串查找活跃域名，精确域名优先
 func (s *Store) GetDomainByName(ctx context.Context, domain string) (*model.Domain, error) {
 	canonicalDomain, _, baseDomain := NormalizeDomain(domain)
 	var d model.Domain
@@ -439,7 +537,25 @@ func (s *Store) GetDomainByName(ctx context.Context, domain string) (*model.Doma
 		`SELECT id, domain, domain_type, base_domain, supports_single, supports_wildcard, is_active, status, created_at, mx_checked_at
 		 FROM domains
 		 WHERE is_active = TRUE AND (domain = $1 OR base_domain = $2)
-		 ORDER BY CASE WHEN domain = $1 THEN 0 ELSE 1 END
+		 ORDER BY CASE WHEN domain = $1 THEN 0 ELSE 1 END, id
+		 LIMIT 1`,
+		canonicalDomain, baseDomain,
+	).Scan(&d.ID, &d.Domain, &d.DomainType, &d.BaseDomain, &d.SupportsSingle, &d.SupportsWildcard, &d.IsActive, &d.Status, &d.CreatedAt, &d.MxCheckedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// GetDomainByAnyName 不限激活状态查找域名，精确域名优先
+func (s *Store) GetDomainByAnyName(ctx context.Context, domain string) (*model.Domain, error) {
+	canonicalDomain, _, baseDomain := NormalizeDomain(domain)
+	var d model.Domain
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, domain, domain_type, base_domain, supports_single, supports_wildcard, is_active, status, created_at, mx_checked_at
+		 FROM domains
+		 WHERE domain = $1 OR base_domain = $2
+		 ORDER BY CASE WHEN domain = $1 THEN 0 ELSE 1 END, id
 		 LIMIT 1`,
 		canonicalDomain, baseDomain,
 	).Scan(&d.ID, &d.Domain, &d.DomainType, &d.BaseDomain, &d.SupportsSingle, &d.SupportsWildcard, &d.IsActive, &d.Status, &d.CreatedAt, &d.MxCheckedAt)
@@ -475,6 +591,7 @@ func (s *Store) ListPendingDomains(ctx context.Context) ([]model.Domain, error) 
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[model.Domain])
 }
 
+// UpdateDomainCapabilities 刷新域名 MX 能力，但不覆盖管理员显式停用的域名。
 func (s *Store) UpdateDomainCapabilities(ctx context.Context, domainID int, supportsSingle, supportsWildcard bool) error {
 	active := supportsSingle || supportsWildcard
 	status := "pending"
@@ -493,74 +610,65 @@ func (s *Store) UpdateDomainCapabilities(ctx context.Context, domainID int, supp
 		     status = $4,
 		     domain_type = $5,
 		     mx_checked_at = NOW()
-		 WHERE id = $6`,
+		 WHERE id = $6 AND status <> 'disabled'`,
 		supportsSingle, supportsWildcard, active, status, domainType, domainID)
 	return err
 }
 
-// PromoteDomainToActive 验证通过，激活域名
-func (s *Store) PromoteDomainToActive(ctx context.Context, domainID int) error {
-	now := time.Now()
-	_, err := s.pool.Exec(ctx,
-		`UPDATE domains SET is_active = TRUE, status = 'active', mx_checked_at = $1 WHERE id = $2`,
-		now, domainID)
-	return err
-}
-
-// TouchDomainCheckTime 更新最后检测时间
-func (s *Store) TouchDomainCheckTime(ctx context.Context, domainID int) error {
-	_, err := s.pool.Exec(ctx,
-		`UPDATE domains SET mx_checked_at = NOW() WHERE id = $1`, domainID)
-	return err
-}
-
-// DisableDomainMX MX检测失败，自动停用域名
-func (s *Store) DisableDomainMX(ctx context.Context, domainID int) error {
-	_, err := s.pool.Exec(ctx,
-		`UPDATE domains
-		 SET is_active = FALSE,
-		     status = 'disabled',
-		     supports_single = FALSE,
-		     supports_wildcard = FALSE,
-		     mx_checked_at = NOW()
-		 WHERE id = $1`,
-		domainID)
-	return err
-}
-
 func (s *Store) DeleteDomain(ctx context.Context, domainID int) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var id int
+	if err := tx.QueryRow(ctx, `SELECT id FROM domains WHERE id = $1 FOR UPDATE`, domainID).Scan(&id); err != nil {
+		return err
+	}
 	var mailboxCount int
-	if err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM mailboxes WHERE domain_id = $1`,
-		domainID,
-	).Scan(&mailboxCount); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM mailboxes WHERE domain_id = $1`, domainID).Scan(&mailboxCount); err != nil {
 		return err
 	}
 	if mailboxCount > 0 {
 		return &DomainInUseError{MailboxCount: mailboxCount}
 	}
-
-	tag, err := s.pool.Exec(ctx, `DELETE FROM domains WHERE id = $1`, domainID)
-	if err == nil && tag.RowsAffected() == 0 {
-		return pgx.ErrNoRows
+	if _, err := tx.Exec(ctx, `DELETE FROM domains WHERE id = $1`, domainID); err != nil {
+		return err
 	}
-	return err
+	return tx.Commit(ctx)
 }
 
 func (s *Store) ToggleDomain(ctx context.Context, domainID int, active bool) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var supportsSingle, supportsWildcard bool
+	if err := tx.QueryRow(ctx,
+		`SELECT supports_single, supports_wildcard FROM domains WHERE id = $1 FOR UPDATE`,
+		domainID,
+	).Scan(&supportsSingle, &supportsWildcard); err != nil {
+		return err
+	}
+	if active && !supportsSingle && !supportsWildcard {
+		return ErrDomainNoCapability
+	}
+
 	status := "disabled"
 	if active {
 		status = "active"
 	}
-	_, err := s.pool.Exec(ctx,
-		`UPDATE domains
-		 SET is_active = $1,
-		     status = $2,
-		     supports_single = CASE WHEN $1 THEN supports_single ELSE FALSE END,
-		     supports_wildcard = CASE WHEN $1 THEN supports_wildcard ELSE FALSE END
-		 WHERE id = $3`,
-		active, status, domainID)
-	return err
+	// 停用时保留原有能力标记，以便管理员后续重新启用。
+	if _, err := tx.Exec(ctx,
+		`UPDATE domains SET is_active = $1, status = $2 WHERE id = $3`,
+		active, status, domainID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // GetStats 返回全局统计数据
@@ -590,19 +698,57 @@ func (s *Store) GetStats(ctx context.Context) (*model.Stats, error) {
 
 // ==================== Mailbox ====================
 
-func (s *Store) CreateMailbox(ctx context.Context, accountID uuid.UUID, address string, domainID int, fullAddress string, ttlMinutes int) (*model.Mailbox, error) {
+func (s *Store) CreateMailboxWithLimit(ctx context.Context, accountID uuid.UUID, address string, domainID int, fullAddress string, ttlMinutes, maxPerUser int) (*model.Mailbox, error) {
 	if ttlMinutes <= 0 {
 		ttlMinutes = 30
 	}
 	expiresAt := time.Now().Add(time.Duration(ttlMinutes) * time.Minute)
+	if maxPerUser <= 0 {
+		var m model.Mailbox
+		err := s.pool.QueryRow(ctx,
+			`INSERT INTO mailboxes (account_id, address, domain_id, full_address, expires_at)
+			 VALUES ($1, $2, $3, $4, $5)
+			 RETURNING id, account_id, address, domain_id, full_address, created_at, expires_at`,
+			accountID, address, domainID, fullAddress, expiresAt,
+		).Scan(&m.ID, &m.AccountID, &m.Address, &m.DomainID, &m.FullAddress, &m.CreatedAt, &m.ExpiresAt)
+		if err != nil {
+			return nil, err
+		}
+		return &m, nil
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 按账户加行锁，防止并发创建绕过每用户活跃邮箱上限
+	var lockedID uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT id FROM accounts WHERE id = $1 FOR UPDATE`, accountID).Scan(&lockedID); err != nil {
+		return nil, err
+	}
+	var activeCount int
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*) FROM mailboxes WHERE account_id = $1 AND expires_at > NOW()`,
+		accountID,
+	).Scan(&activeCount); err != nil {
+		return nil, err
+	}
+	if activeCount >= maxPerUser {
+		return nil, ErrMailboxLimitReached
+	}
+
 	var m model.Mailbox
-	err := s.pool.QueryRow(ctx,
+	if err := tx.QueryRow(ctx,
 		`INSERT INTO mailboxes (account_id, address, domain_id, full_address, expires_at)
 		 VALUES ($1, $2, $3, $4, $5)
 		 RETURNING id, account_id, address, domain_id, full_address, created_at, expires_at`,
 		accountID, address, domainID, fullAddress, expiresAt,
-	).Scan(&m.ID, &m.AccountID, &m.Address, &m.DomainID, &m.FullAddress, &m.CreatedAt, &m.ExpiresAt)
-	if err != nil {
+	).Scan(&m.ID, &m.AccountID, &m.Address, &m.DomainID, &m.FullAddress, &m.CreatedAt, &m.ExpiresAt); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return &m, nil
@@ -657,19 +803,6 @@ func (s *Store) DeleteMailbox(ctx context.Context, mailboxID uuid.UUID, accountI
 		return pgx.ErrNoRows
 	}
 	return nil
-}
-
-func (s *Store) GetMailboxByFullAddress(ctx context.Context, fullAddress string) (*model.Mailbox, error) {
-	var m model.Mailbox
-	err := s.pool.QueryRow(ctx,
-		`SELECT id, account_id, address, domain_id, full_address, created_at, expires_at
-		 FROM mailboxes WHERE full_address = $1 AND expires_at > NOW()`,
-		strings.ToLower(fullAddress),
-	).Scan(&m.ID, &m.AccountID, &m.Address, &m.DomainID, &m.FullAddress, &m.CreatedAt, &m.ExpiresAt)
-	if err != nil {
-		return nil, err
-	}
-	return &m, nil
 }
 
 // ErrExtendLimitReached 表示邮箱已达到最长存活时间，不能再续期。
@@ -739,23 +872,7 @@ type MXCheckDetail struct {
 	Status  string   `json:"status"`
 }
 
-// CheckDomainMX 检测域名MX记录是否指向指定服务器IP。
-// 域名激活只要求单域名或通配子域名其中一种能力可用。
-func CheckDomainMX(domain, serverIP string) (matched bool, mxHosts []string, status string) {
-	matched, details, status := CheckDomainMXDetails(domain, serverIP)
-	seen := make(map[string]bool)
-	for _, detail := range details {
-		for _, host := range detail.MXHosts {
-			if !seen[host] {
-				seen[host] = true
-				mxHosts = append(mxHosts, host)
-			}
-		}
-	}
-	return matched, mxHosts, status
-}
-
-func CheckDomainMXDetails(domain, serverIP string) (matched bool, details []MXCheckDetail, status string) {
+func CheckDomainMXDetails(ctx context.Context, domain, serverIP string) (matched bool, details []MXCheckDetail, status string) {
 	_, _, baseDomain := NormalizeDomain(domain)
 	targets := []MXCheckDetail{
 		{Kind: "single", Name: baseDomain},
@@ -765,7 +882,7 @@ func CheckDomainMXDetails(domain, serverIP string) (matched bool, details []MXCh
 	anyMatched := false
 	statuses := make([]string, 0, len(targets))
 	for _, target := range targets {
-		detail := checkMXName(target.Kind, target.Name, serverIP)
+		detail := checkMXName(ctx, target.Kind, target.Name, serverIP)
 		if detail.Matched {
 			anyMatched = true
 		}
@@ -791,9 +908,14 @@ func DomainCapabilitiesFromMX(details []MXCheckDetail) (supportsSingle, supports
 	return supportsSingle, supportsWildcard
 }
 
-func checkMXName(kind, lookupName, serverIP string) MXCheckDetail {
+func checkMXName(ctx context.Context, kind, lookupName, serverIP string) MXCheckDetail {
 	detail := MXCheckDetail{Kind: kind, Name: lookupName}
-	mxRecords, err := net.LookupMX(lookupName)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	mxCtx, mxCancel := context.WithTimeout(ctx, dnsLookupTimeout)
+	mxRecords, err := net.DefaultResolver.LookupMX(mxCtx, lookupName)
+	mxCancel()
 	if err != nil {
 		detail.Status = fmt.Sprintf("DNS查询失败: %v", err)
 		return detail
@@ -805,7 +927,9 @@ func checkMXName(kind, lookupName, serverIP string) MXCheckDetail {
 	for _, mx := range mxRecords {
 		host := strings.TrimSuffix(mx.Host, ".")
 		detail.MXHosts = append(detail.MXHosts, host)
-		addrs, err := net.LookupHost(host)
+		hostCtx, hostCancel := context.WithTimeout(ctx, dnsLookupTimeout)
+		addrs, err := net.DefaultResolver.LookupHost(hostCtx, host)
+		hostCancel()
 		if err != nil {
 			continue
 		}

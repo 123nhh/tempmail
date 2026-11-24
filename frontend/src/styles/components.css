@@ -145,7 +145,6 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 .tbl tbody tr:hover { background: var(--tint); }
 .tbl .num { text-align: right; font-variant-numeric: tabular-nums; }
 .tbl .act { text-align: right; white-space: nowrap; width: 1%; }
-.tbl .empty-row td { text-align: center; color: var(--text-3); padding: 28px 14px; }
 .tbl tr.clickable { cursor: pointer; }
 
 /* ─── 提示条 ─── */

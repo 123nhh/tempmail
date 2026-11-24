@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
-import { Save, RotateCcw, Globe, LogIn, Mail, Server, Megaphone, Info } from '@lucide/vue'
+import { Save, RotateCcw, Globe, LogIn, Mail, Server, Megaphone } from '@lucide/vue'
 import PageHeader from '../../components/ui/PageHeader.vue'
 import ToggleSwitch from '../../components/ui/ToggleSwitch.vue'
 import SkeletonRows from '../../components/ui/SkeletonRows.vue'
@@ -12,12 +12,12 @@ const session = useSession()
 const origin = window.location.origin
 
 // 后端所有值都是字符串；布尔项用 'true' / 'false'
-const BOOLS = ['registration_open', 'key_login_enabled', 'linuxdo_login_enabled', 'github_login_enabled', 'rate_limit_enabled']
+const BOOLS = ['registration_open', 'key_login_enabled', 'linuxdo_login_enabled', 'github_login_enabled']
 const SECRETS = ['linuxdo_client_secret', 'github_client_secret']
 const KEYS = [
   ...BOOLS,
   'site_title', 'site_logo_url', 'announcement',
-  'mailbox_ttl_minutes', 'max_mailboxes_per_user', 'default_domain',
+  'mailbox_ttl_minutes', 'mailbox_extend_minutes', 'mailbox_max_lifetime_minutes', 'max_mailboxes_per_user', 'default_domain',
   'smtp_server_ip', 'smtp_hostname',
   'linuxdo_client_id', 'linuxdo_redirect_url', 'github_client_id', 'github_redirect_url',
   ...SECRETS,
@@ -61,19 +61,22 @@ function reset() {
   Object.assign(form, orig.value)
 }
 
-const ttlErr = computed(() => {
-  const v = String(form.mailbox_ttl_minutes ?? '').trim()
-  if (!v) return ''
-  return /^\d+$/.test(v) && +v > 0 ? '' : '请输入正整数'
-})
-const maxErr = computed(() => {
-  const v = String(form.max_mailboxes_per_user ?? '').trim()
-  if (!v) return ''
-  return /^\d+$/.test(v) ? '' : '请输入非负整数'
-})
+function validateInt(val, { min = 0, max = 525600, allowEmpty = true } = {}) {
+  const v = String(val ?? '').trim()
+  if (!v) return allowEmpty ? '' : `请输入 ${min} 到 ${max} 的整数`
+  if (!/^\d+$/.test(v)) return `请输入 ${min} 到 ${max} 的整数`
+  const n = Number(v)
+  return n >= min && n <= max ? '' : `请输入 ${min} 到 ${max} 的整数`
+}
+
+const ttlErr = computed(() => validateInt(form.mailbox_ttl_minutes, { min: 1 }))
+const extendErr = computed(() => validateInt(form.mailbox_extend_minutes, { min: 0 }))
+const maxLifeErr = computed(() => validateInt(form.mailbox_max_lifetime_minutes, { min: 0 }))
+const maxErr = computed(() => validateInt(form.max_mailboxes_per_user, { min: 0 }))
+const hasValidationErr = computed(() => !!(ttlErr.value || extendErr.value || maxLifeErr.value || maxErr.value))
 
 async function save() {
-  if (ttlErr.value || maxErr.value) {
+  if (hasValidationErr.value) {
     toast.error('请先修正表单中的错误')
     return
   }
@@ -109,7 +112,7 @@ onMounted(load)
       <button type="button" class="btn btn-secondary" :disabled="!dirty || saving" @click="reset">
         <RotateCcw aria-hidden="true" />撤销修改
       </button>
-      <button type="submit" form="settings-form" class="btn btn-primary" :disabled="!dirty || saving || loading">
+      <button type="submit" form="settings-form" class="btn btn-primary" :disabled="!dirty || saving || loading || hasValidationErr">
         <Save aria-hidden="true" />{{ saving ? '保存中…' : '保存设置' }}
       </button>
     </template>
@@ -154,25 +157,30 @@ onMounted(load)
           <label for="s-ttl">邮箱有效期（分钟）</label>
           <input id="s-ttl" v-model="form.mailbox_ttl_minutes" class="inp" inputmode="numeric" placeholder="30" :aria-invalid="ttlErr ? 'true' : undefined" />
           <span v-if="ttlErr" class="err-t">{{ ttlErr }}</span>
-          <span v-else class="hint">新建邮箱在此时长后自动删除，留空为 30 分钟</span>
+          <span v-else class="hint">新建邮箱在此时长后自动过期并清理（最小 1 分钟，留空默认 30 分钟）</span>
         </div>
         <div class="field">
-          <label for="s-max">每用户邮箱上限</label>
+          <label for="s-ext">单次续期时长（分钟）</label>
+          <input id="s-ext" v-model="form.mailbox_extend_minutes" class="inp" inputmode="numeric" placeholder="30" :aria-invalid="extendErr ? 'true' : undefined" />
+          <span v-if="extendErr" class="err-t">{{ extendErr }}</span>
+          <span v-else class="hint">留空或设为 0 时跟随上方邮箱有效期</span>
+        </div>
+        <div class="field">
+          <label for="s-maxlife">单个邮箱最长存活时间（分钟）</label>
+          <input id="s-maxlife" v-model="form.mailbox_max_lifetime_minutes" class="inp" inputmode="numeric" placeholder="1440" :aria-invalid="maxLifeErr ? 'true' : undefined" />
+          <span v-if="maxLifeErr" class="err-t">{{ maxLifeErr }}</span>
+          <span v-else class="hint">续期上限，0 表示不限（留空默认 1440 = 24 小时）</span>
+        </div>
+        <div class="field">
+          <label for="s-max">每用户活跃邮箱上限</label>
           <input id="s-max" v-model="form.max_mailboxes_per_user" class="inp" inputmode="numeric" placeholder="不限" :aria-invalid="maxErr ? 'true' : undefined" />
           <span v-if="maxErr" class="err-t">{{ maxErr }}</span>
-          <span v-else class="hint warn-hint"><Info aria-hidden="true" />当前后端版本只保存该值，创建邮箱时不做限制</span>
+          <span v-else class="hint">留空或 0 表示不限，超限时创建邮箱返回 409</span>
         </div>
         <div class="field">
           <label for="s-dd">默认域名</label>
           <input id="s-dd" v-model="form.default_domain" class="inp inp-mono" placeholder="example.com" />
-          <span class="hint warn-hint"><Info aria-hidden="true" />当前后端版本只保存该值，随机创建时不会优先使用</span>
-        </div>
-        <div class="sw-row">
-          <div>
-            <strong>速率限制开关</strong>
-            <p class="hint warn-hint"><Info aria-hidden="true" />当前后端版本只保存该值；实际限流由 RATE_LIMIT 环境变量控制</p>
-          </div>
-          <ToggleSwitch v-model="form.rate_limit_enabled" label="速率限制开关" />
+          <span class="hint">留空随机；填写已启用域名后，未指定域名创建邮箱时优先使用</span>
         </div>
       </div>
     </section>
@@ -239,8 +247,6 @@ onMounted(load)
 .sw-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .sw-row strong { font-size: 13px; font-weight: 500; }
 .sw-row .hint { margin-top: 2px; }
-.warn-hint { display: flex; gap: 4px; align-items: flex-start; color: var(--warn); }
-.warn-hint svg { width: 13px; height: 13px; flex: none; margin-top: 2px; }
 textarea.inp { height: auto; padding: 8px 10px; resize: vertical; }
 @media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
 </style>

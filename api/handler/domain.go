@@ -12,7 +12,10 @@ import (
 	"tempmail/store"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 )
+
+const maxPendingDomains = 50
 
 type DomainHandler struct {
 	store       *store.Store
@@ -33,7 +36,7 @@ func (h *DomainHandler) getServerIP(ctx context.Context) string {
 }
 
 // getServerHostname 返回 MX 记录应指向的邮件服务器 hostname
-// 优先: DB 设置 smtp_hostname → 环境变量 → 空串（傻用 mail.提交域名 方式）
+// 优先: DB 设置 smtp_hostname → 环境变量 → 空串（回退 mail.提交域名 方式）
 func (h *DomainHandler) getServerHostname(ctx context.Context) string {
 	if hn, err := h.store.GetSetting(ctx, "smtp_hostname"); err == nil && hn != "" {
 		return hn
@@ -41,19 +44,8 @@ func (h *DomainHandler) getServerHostname(ctx context.Context) string {
 	return h.cfgHostname
 }
 
-func dnsHostForDomain(domain string) string {
-	_, domainType, _ := store.NormalizeDomain(domain)
-	if domainType == store.DomainTypeWildcard {
-		return "*"
-	}
-	return "@"
-}
-
 func mailHostForDomain(domain string) string {
-	_, domainType, baseDomain := store.NormalizeDomain(domain)
-	if domainType == store.DomainTypeWildcard {
-		return "mail." + baseDomain
-	}
+	_, _, baseDomain := store.NormalizeDomain(domain)
 	return "mail." + baseDomain
 }
 
@@ -137,6 +129,10 @@ func (h *DomainHandler) Delete(c *gin.Context) {
 			})
 			return
 		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -161,7 +157,14 @@ func (h *DomainHandler) Toggle(c *gin.Context) {
 	}
 
 	if err := h.store.ToggleDomain(c.Request.Context(), id, req.Active); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
+		case errors.Is(err, store.ErrDomainNoCapability):
+			c.JSON(http.StatusConflict, gin.H{"error": "域名尚未通过 MX 检测且无可用收信能力，无法启用"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
 		return
 	}
 
@@ -181,12 +184,12 @@ func (h *DomainHandler) MXImport(c *gin.Context) {
 	}
 	req.Domain = strings.ToLower(strings.TrimSpace(req.Domain))
 
-	// 获取服务器 IP / hostname（来自 DB 设置或环境变量，不内置硬编码）
-	serverIP := h.getServerIP(c.Request.Context())
-	hostname := h.getServerHostname(c.Request.Context())
+	ctx := c.Request.Context()
+	serverIP := h.getServerIP(ctx)
+	hostname := h.getServerHostname(ctx)
 
 	// DNS MX 检测
-	matched, mxDetails, mxStatus := store.CheckDomainMXDetails(req.Domain, serverIP)
+	matched, mxDetails, mxStatus := store.CheckDomainMXDetails(ctx, req.Domain, serverIP)
 	supportsSingle, supportsWildcard := store.DomainCapabilitiesFromMX(mxDetails)
 
 	if !matched && !req.Force {
@@ -203,7 +206,7 @@ func (h *DomainHandler) MXImport(c *gin.Context) {
 	}
 
 	// 导入到域名池
-	domain, err := h.store.AddDomainWithCapabilities(c.Request.Context(), req.Domain, supportsSingle, supportsWildcard)
+	domain, err := h.store.AddDomainWithCapabilities(ctx, req.Domain, supportsSingle, supportsWildcard)
 	if err != nil {
 		if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
 			c.JSON(http.StatusConflict, gin.H{"error": "域名已存在"})
@@ -223,9 +226,18 @@ func (h *DomainHandler) MXImport(c *gin.Context) {
 	})
 }
 
-// POST /api/admin/domains/mx-register - 提交域名等待自动MX验证（无需手动确认）
+// POST /api/admin/domains/mx-register - 管理员提交域名等待自动MX验证（允许重新激活已停用域名）
 // body: {"domain":"example.com"}
 func (h *DomainHandler) MXRegister(c *gin.Context) {
+	h.submitDomain(c, true)
+}
+
+// POST /api/domains/submit — 任意已登录用户提交域名进行 MX 自动验证（禁止绕过管理员停用态，且受待验证队列上限限制）
+func (h *DomainHandler) Submit(c *gin.Context) {
+	h.submitDomain(c, false)
+}
+
+func (h *DomainHandler) submitDomain(c *gin.Context, allowReactivate bool) {
 	var req struct {
 		Domain string `json:"domain" binding:"required"`
 	}
@@ -235,52 +247,47 @@ func (h *DomainHandler) MXRegister(c *gin.Context) {
 	}
 	req.Domain = strings.ToLower(strings.TrimSpace(req.Domain))
 
-	serverIP := h.getServerIP(c.Request.Context())
-	hostname := h.getServerHostname(c.Request.Context())
-	dnsRequired := dnsRecordsForDomain(req.Domain, serverIP, hostname)
-
-	// 先尝试立即检测；通过则直接激活
-	matched, mxDetails, mxStatus := store.CheckDomainMXDetails(req.Domain, serverIP)
-	supportsSingle, supportsWildcard := store.DomainCapabilitiesFromMX(mxDetails)
-	if matched {
-		domain, err := h.store.AddDomainWithCapabilities(c.Request.Context(), req.Domain, supportsSingle, supportsWildcard)
-		if err != nil {
-			if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
-				// 已存在则直接返回
-				domains, _ := h.store.ListDomains(c.Request.Context())
-				canonicalDomain, _, _ := store.NormalizeDomain(req.Domain)
-				for _, d := range domains {
-					if d.Domain == canonicalDomain {
-						c.JSON(http.StatusOK, gin.H{
-							"domain":       d,
-							"status":       d.Status,
-							"mx_status":    mxStatus,
-							"mx_details":   mxDetails,
-							"dns_required": dnsRequired,
-							"message":      "域名已存在且处于激活状态",
-						})
-						return
-					}
-				}
-			}
+	ctx := c.Request.Context()
+	if !allowReactivate {
+		if existing, err := h.store.GetDomainByAnyName(ctx, req.Domain); err == nil && existing != nil && existing.Status == "disabled" {
+			c.JSON(http.StatusForbidden, gin.H{"error": "该域名已被管理员停用，无法重新提交"})
+			return
+		} else if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
+	}
+
+	serverIP := h.getServerIP(ctx)
+	hostname := h.getServerHostname(ctx)
+	dnsRequired := dnsRecordsForDomain(req.Domain, serverIP, hostname)
+
+	// 先尝试立即检测；通过则直接激活
+	matched, mxDetails, mxStatus := store.CheckDomainMXDetails(ctx, req.Domain, serverIP)
+	supportsSingle, supportsWildcard := store.DomainCapabilitiesFromMX(mxDetails)
+
+	domain, err := h.store.SubmitDomain(ctx, req.Domain, matched, supportsSingle, supportsWildcard, allowReactivate, maxPendingDomains)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrDomainDisabled):
+			c.JSON(http.StatusForbidden, gin.H{"error": "该域名已被管理员停用，无法重新提交"})
+		case errors.Is(err, store.ErrPendingDomainsLimit):
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": fmt.Sprintf("待验证域名队列已满（上限 %d），请稍后再试", maxPendingDomains)})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+
+	if matched {
 		c.JSON(http.StatusCreated, gin.H{
 			"domain":       domain,
-			"status":       "active",
+			"status":       domain.Status,
 			"mx_status":    mxStatus,
 			"mx_details":   mxDetails,
 			"dns_required": dnsRequired,
 			"message":      "MX验证通过，域名已立即加入域名池",
 		})
-		return
-	}
-
-	// MX未通过 → 加入 pending，等待后台自动轮询
-	domain, err := h.store.AddDomainPending(c.Request.Context(), req.Domain)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -295,13 +302,7 @@ func (h *DomainHandler) MXRegister(c *gin.Context) {
 	})
 }
 
-// POST /api/domains/submit — 任意已登录用户提交域名进行 MX 自动验证
-// 与 MXRegister 逻辑相同，但不需要管理员权限
-func (h *DomainHandler) Submit(c *gin.Context) {
-	h.MXRegister(c) // 复用相同逻辑
-}
-
-// GET /api/admin/domains/:id/status - 查询域名状态（用于前端轮询）
+// GET /api/domains/:id/status / GET /api/admin/domains/:id/status - 查询域名状态（用于前端轮询）
 func (h *DomainHandler) GetStatus(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
@@ -309,13 +310,14 @@ func (h *DomainHandler) GetStatus(c *gin.Context) {
 		return
 	}
 
-	domain, err := h.store.GetDomainByID(c.Request.Context(), id)
+	ctx := c.Request.Context()
+	domain, err := h.store.GetDomainByID(ctx, id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
 		return
 	}
-	serverIP := h.getServerIP(c.Request.Context())
-	_, mxDetails, mxStatus := store.CheckDomainMXDetails(domain.Domain, serverIP)
+	serverIP := h.getServerIP(ctx)
+	_, mxDetails, mxStatus := store.CheckDomainMXDetails(ctx, domain.Domain, serverIP)
 
 	c.JSON(http.StatusOK, gin.H{
 		"id":                domain.ID,
@@ -332,18 +334,36 @@ func (h *DomainHandler) GetStatus(c *gin.Context) {
 
 // POST /api/admin/domains/refresh-mx - 手动刷新所有域名的单域名/通配子域 MX 能力
 func (h *DomainHandler) RefreshMX(c *gin.Context) {
-	domains, err := h.store.ListDomains(c.Request.Context())
+	ctx := c.Request.Context()
+	domains, err := h.store.ListDomains(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	serverIP := h.getServerIP(c.Request.Context())
+	serverIP := h.getServerIP(ctx)
+	if serverIP == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请先在系统设置中配置服务器公网 IP (smtp_server_ip)"})
+		return
+	}
+
 	results := make([]gin.H, 0, len(domains))
 	for _, domain := range domains {
-		_, mxDetails, mxStatus := store.CheckDomainMXDetails(domain.Domain, serverIP)
+		if domain.Status == "disabled" {
+			results = append(results, gin.H{
+				"id":                domain.ID,
+				"domain":            domain.Domain,
+				"supports_single":   domain.SupportsSingle,
+				"supports_wildcard": domain.SupportsWildcard,
+				"is_active":         false,
+				"mx_status":         "已由管理员停用",
+				"mx_details":        []store.MXCheckDetail{},
+			})
+			continue
+		}
+		_, mxDetails, mxStatus := store.CheckDomainMXDetails(ctx, domain.Domain, serverIP)
 		supportsSingle, supportsWildcard := store.DomainCapabilitiesFromMX(mxDetails)
-		if err := h.store.UpdateDomainCapabilities(c.Request.Context(), domain.ID, supportsSingle, supportsWildcard); err != nil {
+		if err := h.store.UpdateDomainCapabilities(ctx, domain.ID, supportsSingle, supportsWildcard); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "domain": domain.Domain})
 			return
 		}

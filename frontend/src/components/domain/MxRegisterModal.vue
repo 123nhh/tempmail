@@ -11,7 +11,10 @@ import { dnsRecordsFor, isValidDomain, normalizeDomain } from '../../utils/dns'
 import { timeAgo } from '../../utils/format'
 
 // 提交域名做 MX 自动验证：通过立即激活，否则进入待验证队列并在弹窗内轮询
-const props = defineProps({ open: { type: Boolean, default: false } })
+const props = defineProps({
+  open: { type: Boolean, default: false },
+  admin: { type: Boolean, default: false },
+})
 const emit = defineEmits(['close', 'changed'])
 
 const session = useSession()
@@ -67,7 +70,7 @@ function poll(id) {
     } catch {
       /* 下次重试 */
     }
-  }, 5000)
+  }, 30000)
 }
 
 async function submit() {
@@ -80,7 +83,7 @@ async function submit() {
   error.value = ''
   errDetails.value = []
   try {
-    const r = await api.submitDomain(d)
+    const r = props.admin ? await api.admin.mxRegister(d) : await api.submitDomain(d)
     const state = r.status === 'active' ? 'active' : 'pending'
     result.value = { state, domain: r.domain, records: r.dns_required || [], details: r.mx_details || [], message: r.message }
     emit('changed')

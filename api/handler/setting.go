@@ -1,55 +1,82 @@
 package handler
 
 import (
+	"context"
 	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	"tempmail/store"
 
 	"github.com/gin-gonic/gin"
 )
 
+const publicSettingsCacheTTL = 5 * time.Second
+
+type settingStore interface {
+	GetAllSettings(ctx context.Context) (map[string]string, error)
+	SetSetting(ctx context.Context, key, value string) error
+}
+
 type SettingHandler struct {
-	store *store.Store
+	store settingStore
+
+	mu       sync.Mutex
+	cached   gin.H
+	cachedAt time.Time
 }
 
 func NewSettingHandler(s *store.Store) *SettingHandler {
 	return &SettingHandler{store: s}
 }
 
-// GET /public/settings → 返回前端需要的公开配置
+func (h *SettingHandler) invalidateCache() {
+	h.mu.Lock()
+	h.cached = nil
+	h.cachedAt = time.Time{}
+	h.mu.Unlock()
+}
+
+// GET /public/settings → 返回前端需要的公开配置（单次批量查询 + 5 秒缓存）
 func (h *SettingHandler) GetPublic(c *gin.Context) {
-	regOpen, err := h.store.GetSetting(c.Request.Context(), "registration_open")
-	if err != nil {
-		regOpen = "false"
+	h.mu.Lock()
+	if h.cached != nil && time.Since(h.cachedAt) < publicSettingsCacheTTL {
+		out := make(gin.H, len(h.cached))
+		for k, v := range h.cached {
+			out[k] = v
+		}
+		h.mu.Unlock()
+		c.JSON(http.StatusOK, out)
+		return
 	}
-	siteTitle, _ := h.store.GetSetting(c.Request.Context(), "site_title")
-	siteLogoURL, _ := h.store.GetSetting(c.Request.Context(), "site_logo_url")
-	smtpIP, _ := h.store.GetSetting(c.Request.Context(), "smtp_server_ip")
-	smtpHostname, _ := h.store.GetSetting(c.Request.Context(), "smtp_hostname")
-	announce, _ := h.store.GetSetting(c.Request.Context(), "announcement")
-	keyLogin, err := h.store.GetSetting(c.Request.Context(), "key_login_enabled")
+	h.mu.Unlock()
+
+	all, err := h.store.GetAllSettings(c.Request.Context())
 	if err != nil {
-		keyLogin = "true"
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "配置暂时不可用"})
+		return
 	}
-	linuxDOLogin, err := h.store.GetSetting(c.Request.Context(), "linuxdo_login_enabled")
-	if err != nil {
-		linuxDOLogin = "false"
+
+	pub := gin.H{
+		"registration_open":     all["registration_open"] == "true",
+		"key_login_enabled":     all["key_login_enabled"] != "false",
+		"linuxdo_login_enabled": all["linuxdo_login_enabled"] == "true",
+		"github_login_enabled":  all["github_login_enabled"] == "true",
+		"site_title":            all["site_title"],
+		"site_logo_url":         all["site_logo_url"],
+		"smtp_server_ip":        all["smtp_server_ip"],
+		"smtp_hostname":         all["smtp_hostname"],
+		"announcement":          all["announcement"],
 	}
-	gitHubLogin, err := h.store.GetSetting(c.Request.Context(), "github_login_enabled")
-	if err != nil {
-		gitHubLogin = "false"
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"registration_open":     regOpen == "true",
-		"key_login_enabled":     keyLogin != "false",
-		"linuxdo_login_enabled": linuxDOLogin == "true",
-		"github_login_enabled":  gitHubLogin == "true",
-		"site_title":            siteTitle,
-		"site_logo_url":         siteLogoURL,
-		"smtp_server_ip":        smtpIP,
-		"smtp_hostname":         smtpHostname,
-		"announcement":          announce,
-	})
+
+	h.mu.Lock()
+	h.cached = pub
+	h.cachedAt = time.Now()
+	h.mu.Unlock()
+
+	c.JSON(http.StatusOK, pub)
 }
 
 // GET /api/admin/settings → 读取所有设置（管理员）
@@ -85,7 +112,6 @@ func (h *SettingHandler) AdminUpdate(c *gin.Context) {
 	// 白名单：已知配置项
 	allowed := map[string]bool{
 		"registration_open":            true,
-		"rate_limit_enabled":           true,
 		"max_mailboxes_per_user":       true,
 		"smtp_server_ip":               true,
 		"smtp_hostname":                true,
@@ -107,6 +133,8 @@ func (h *SettingHandler) AdminUpdate(c *gin.Context) {
 		"github_redirect_url":          true,
 	}
 
+	// 先完整校验所有字段再落库，避免部分写入
+	toWrite := make(map[string]string, len(req))
 	for k, v := range req {
 		if !allowed[k] {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "unknown setting key: " + k})
@@ -115,10 +143,34 @@ func (h *SettingHandler) AdminUpdate(c *gin.Context) {
 		if (k == "linuxdo_client_secret" || k == "github_client_secret") && v == "" {
 			continue
 		}
+		if strings.HasSuffix(k, "_enabled") || k == "registration_open" {
+			if v != "true" && v != "false" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": k + " must be true or false"})
+				return
+			}
+		}
+		if strings.HasSuffix(k, "_minutes") || k == "max_mailboxes_per_user" {
+			if v != "" {
+				n, err := strconv.Atoi(v)
+				if err != nil || n < 0 || n > 525600 {
+					c.JSON(http.StatusBadRequest, gin.H{"error": k + " must be an integer between 0 and 525600"})
+					return
+				}
+				if k == "mailbox_ttl_minutes" && n == 0 {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "mailbox_ttl_minutes must be greater than 0"})
+					return
+				}
+			}
+		}
+		toWrite[k] = v
+	}
+
+	for k, v := range toWrite {
 		if err := h.store.SetSetting(c.Request.Context(), k, v); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 	}
+	h.invalidateCache()
 	c.JSON(http.StatusOK, gin.H{"message": "settings updated"})
 }

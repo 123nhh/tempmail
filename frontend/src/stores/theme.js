@@ -12,9 +12,6 @@ export const useTheme = defineStore('theme', {
     const theme = mode === 'auto' ? systemTheme() : localStorage.getItem('tm_theme') || 'light'
     return { mode, theme }
   },
-  getters: {
-    label: s => (s.mode === 'auto' ? `跟随系统 · ${s.theme === 'dark' ? '深色' : '浅色'}` : s.theme === 'dark' ? '深色' : '浅色'),
-  },
   actions: {
     apply() {
       document.documentElement.dataset.theme = this.theme

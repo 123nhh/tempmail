@@ -16,10 +16,12 @@ const domains = ref([])
 const loading = ref(false)
 const busy = ref(false)
 const error = ref('')
+let sessionSeq = 0
 
 const address = ref('')
 const domainId = ref('')
 const mode = ref('single')
+const modeChosen = ref(false)
 const subdomain = ref('')
 
 const LOCAL_RE = /^[A-Za-z0-9_-]+$/
@@ -28,9 +30,13 @@ const SUB_RE = /^([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)(\.[A-Za-z0-9](?:[A-Z
 const baseOf = d => d.base_domain || String(d.domain || '').replace(/^\*\./, '')
 
 const selected = computed(() => domains.value.find(d => String(d.id) === String(domainId.value)) || null)
-// 随机域名时两种模式都可选，由后端决定落在哪个域名
-const canSingle = computed(() => !selected.value || !!selected.value.supports_single)
-const canMulti = computed(() => !selected.value || !!selected.value.supports_wildcard)
+// 未指定域名时，根据所有启用域名的实际能力决定可选模式
+const canSingle = computed(() =>
+  selected.value ? !!selected.value.supports_single : domains.value.some(d => d.supports_single),
+)
+const canMulti = computed(() =>
+  selected.value ? !!selected.value.supports_wildcard : domains.value.some(d => d.supports_wildcard),
+)
 const base = computed(() => (selected.value ? baseOf(selected.value) : 'example.com'))
 
 const preview = computed(() => {
@@ -51,28 +57,38 @@ const subError = computed(() =>
 
 watch([canSingle, canMulti], ([s, m]) => {
   if (!s && m) mode.value = 'multi'
-  if (s && !m) mode.value = 'single'
+  else if (s && !m) mode.value = 'single'
 })
 
+function pickMode(next) {
+  mode.value = next
+  modeChosen.value = true
+}
+
 async function loadDomains() {
+  const seq = sessionSeq
   loading.value = true
   try {
     const all = await api.domains()
+    if (seq !== sessionSeq) return
     domains.value = (all || []).filter(d => d.is_active)
     domainId.value = ''
+    if (!canSingle.value && canMulti.value) mode.value = 'multi'
   } catch {
+    if (seq !== sessionSeq) return
     domains.value = []
   } finally {
-    loading.value = false
+    if (seq === sessionSeq) loading.value = false
   }
 }
 
 function reset() {
+  sessionSeq++
   address.value = ''
   subdomain.value = ''
   mode.value = 'single'
+  modeChosen.value = false
   error.value = ''
-  busy.value = false
 }
 
 watch(
@@ -81,6 +97,8 @@ watch(
     if (v) {
       reset()
       loadDomains()
+    } else {
+      sessionSeq++
     }
   },
 )
@@ -93,21 +111,31 @@ function label(d) {
 
 async function submit() {
   if (addressError.value || subError.value || busy.value) return
+  const seq = sessionSeq
   busy.value = true
   error.value = ''
   try {
-    const body = { mode: mode.value }
+    const body = {}
     const a = address.value.trim()
     if (a) body.address = a
     if (domainId.value) body.domain_id = Number(domainId.value)
-    if (mode.value === 'multi' && canMulti.value && subdomain.value.trim()) body.subdomain = subdomain.value.trim()
+    // 随机域名且用户未手动切换模式时省略 mode，由后端按可用能力自动选择
+    if (domainId.value || modeChosen.value || (canSingle.value !== canMulti.value)) {
+      body.mode = mode.value
+    }
+    if (mode.value === 'multi' && canMulti.value && subdomain.value.trim()) {
+      body.mode = 'multi'
+      body.subdomain = subdomain.value.trim()
+    }
     const mb = await api.createMailbox(body)
     toast.success(`已创建：${mb.full_address}`)
-    mailboxesChanged(mb)
-    emit('close')
-    if (mb.id) router.push({ name: 'mailbox', params: { id: mb.id } })
+    mailboxesChanged()
+    if (seq === sessionSeq) {
+      emit('close')
+      if (mb.id) router.push({ name: 'mailbox', params: { id: mb.id } })
+    }
   } catch (e) {
-    error.value = e.message
+    if (seq === sessionSeq) error.value = e.message
   } finally {
     busy.value = false
   }
@@ -145,8 +173,8 @@ async function submit() {
       <div v-if="canSingle && canMulti" class="field">
         <span id="mb-mode-l" class="field-label">生成模式</span>
         <div class="seg" role="radiogroup" aria-labelledby="mb-mode-l">
-          <button type="button" role="radio" :aria-checked="mode === 'single' ? 'true' : 'false'" @click="mode = 'single'">单域名</button>
-          <button type="button" role="radio" :aria-checked="mode === 'multi' ? 'true' : 'false'" @click="mode = 'multi'">
+          <button type="button" role="radio" :aria-checked="mode === 'single' ? 'true' : 'false'" @click="pickMode('single')">单域名</button>
+          <button type="button" role="radio" :aria-checked="mode === 'multi' ? 'true' : 'false'" @click="pickMode('multi')">
             <Shuffle aria-hidden="true" />多级子域
           </button>
         </div>

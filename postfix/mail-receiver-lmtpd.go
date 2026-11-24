@@ -3,7 +3,7 @@
 // 替代原本每封邮件 fork 一次 Go 二进制的 pipe 模式：
 //  1. Postfix 把虚拟域名邮件转发到本进程的 unix socket（LMTP）
 //  2. 本进程长期常驻，单进程并发处理多条 LMTP 会话
-//  3. 解析邮件后调 API /internal/deliver 入库
+//  3. 解析邮件（含 RFC 2047 邮件头、base64 / quoted-printable、常见字符集）后调 API /internal/deliver 入库
 //  4. 入库失败时返回 LMTP 4xx，Postfix 把邮件保留在队列里自动重试，不会丢失
 //
 // 协议参考 RFC 2033 (LMTP)。Postfix 支持把这种 socket 当成 transport。
@@ -20,12 +20,15 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"mime"
 	"mime/multipart"
+	"mime/quotedprintable"
 	"net"
 	"net/http"
 	"net/mail"
@@ -37,13 +40,23 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 const (
-	maxMessageBytes       = 25 << 20
+	maxMessageBytes       = 10 << 20
+	maxDiscardBytes       = 20 << 20
 	maxBatchResponseBytes = 4 << 20
+	maxRecipientsPerTx    = 256
+	maxMultipartDepth     = 16
+	maxMultipartParts     = 128
+	maxSenderRunes        = 320
+	maxSubjectRunes       = 998
 	apiTimeout            = 15 * time.Second
+	shutdownDrainTimeout  = 10 * time.Second
 )
+
+var errMessageTooLarge = errors.New("message exceeds maximum size")
 
 type deliverPayload struct {
 	Recipient string `json:"recipient"`
@@ -78,6 +91,7 @@ type server struct {
 	apiURL     string
 	httpClient *http.Client
 	conns      atomic.Int64
+	sessionsWG sync.WaitGroup
 }
 
 func main() {
@@ -100,8 +114,8 @@ func main() {
 		if err != nil {
 			log.Fatalf("listen unix %s: %v", sockPath, err)
 		}
-		// Postfix 默认以 postfix 用户连接，需要可写权限
-		if err := os.Chmod(sockPath, 0o666); err != nil {
+		// Postfix 默认以 postfix 用户连接（entrypoint 会 chown postfix:postfix），限制为 0660
+		if err := os.Chmod(sockPath, 0o660); err != nil {
 			log.Printf("chmod socket: %v", err)
 		}
 		log.Printf("LMTP listening on unix:%s", sockPath)
@@ -124,11 +138,11 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	var wg sync.WaitGroup
+	var acceptWG sync.WaitGroup
 	for _, l := range listeners {
-		wg.Add(1)
+		acceptWG.Add(1)
 		go func(l net.Listener) {
-			defer wg.Done()
+			defer acceptWG.Done()
 			srv.acceptLoop(ctx, l)
 		}(l)
 	}
@@ -138,7 +152,20 @@ func main() {
 	for _, l := range listeners {
 		_ = l.Close()
 	}
-	wg.Wait()
+	acceptWG.Wait()
+
+	// Wait for in-flight LMTP sessions to finish up to shutdownDrainTimeout.
+	drained := make(chan struct{})
+	go func() {
+		srv.sessionsWG.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+		log.Printf("all LMTP sessions drained cleanly")
+	case <-time.After(shutdownDrainTimeout):
+		log.Printf("drain timeout reached with %d active conns remaining", srv.conns.Load())
+	}
 }
 
 func getenv(key, fallback string) string {
@@ -191,7 +218,8 @@ func (s *server) acceptLoop(ctx context.Context, l net.Listener) {
 			if ctx.Err() != nil {
 				return
 			}
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}
@@ -199,7 +227,9 @@ func (s *server) acceptLoop(ctx context.Context, l net.Listener) {
 			return
 		}
 		s.conns.Add(1)
+		s.sessionsWG.Add(1)
 		go func() {
+			defer s.sessionsWG.Done()
 			defer s.conns.Add(-1)
 			s.handle(ctx, conn)
 		}()
@@ -211,8 +241,16 @@ type session struct {
 	conn       net.Conn
 	r          *bufio.Reader
 	w          *bufio.Writer
+	greeted    bool
+	inMail     bool
 	from       string
 	recipients []string
+}
+
+func (s *session) resetTx() {
+	s.inMail = false
+	s.from = ""
+	s.recipients = s.recipients[:0]
 }
 
 func (s *server) handle(ctx context.Context, conn net.Conn) {
@@ -228,6 +266,9 @@ func (s *server) handle(ctx context.Context, conn net.Conn) {
 	sess.writeLine("220 %s LMTP ready", s.hostname)
 
 	for {
+		if ctx.Err() != nil && !sess.inMail {
+			return
+		}
 		line, err := sess.readLine()
 		if err != nil {
 			return
@@ -235,40 +276,65 @@ func (s *server) handle(ctx context.Context, conn net.Conn) {
 		cmd, args := parseCommand(line)
 		switch cmd {
 		case "LHLO":
+			sess.greeted = true
+			sess.resetTx()
 			sess.writeLine("250-%s", s.hostname)
 			sess.writeLine("250-PIPELINING")
 			sess.writeLine("250-8BITMIME")
 			sess.writeLine("250-SIZE %d", maxMessageBytes)
 			sess.writeLine("250 ENHANCEDSTATUSCODES")
 		case "MAIL":
+			if !sess.greeted {
+				sess.writeLine("503 5.5.1 send LHLO first")
+				continue
+			}
+			sess.resetTx()
 			sess.from = extractAddr(args)
-			sess.recipients = sess.recipients[:0]
+			sess.inMail = true
 			sess.writeLine("250 2.1.0 OK")
 		case "RCPT":
+			if !sess.inMail {
+				sess.writeLine("503 5.5.1 send MAIL first")
+				continue
+			}
 			addr := extractAddr(args)
 			if addr == "" {
 				sess.writeLine("501 5.1.3 bad recipient")
 				continue
 			}
+			if len(sess.recipients) >= maxRecipientsPerTx {
+				sess.writeLine("452 4.5.3 too many recipients")
+				continue
+			}
 			sess.recipients = append(sess.recipients, addr)
 			sess.writeLine("250 2.1.5 OK")
 		case "DATA":
-			if len(sess.recipients) == 0 {
+			if !sess.inMail || len(sess.recipients) == 0 {
 				sess.writeLine("503 5.5.1 no recipients")
 				continue
 			}
 			sess.writeLine("354 end with <CR><LF>.<CR><LF>")
 			data, err := sess.readData()
+			if errors.Is(err, errMessageTooLarge) {
+				// RFC 2033: reply once per accepted recipient after DATA terminator.
+				for range sess.recipients {
+					sess.writeLine("552 5.3.4 message exceeds %d bytes", maxMessageBytes)
+				}
+				sess.resetTx()
+				_ = sess.conn.SetDeadline(time.Now().Add(2 * time.Minute))
+				continue
+			}
 			if err != nil {
 				return
 			}
-			sess.deliverAll(ctx, data)
-			sess.from = ""
-			sess.recipients = sess.recipients[:0]
+			// Give in-flight delivery its own bounded timeout so graceful shutdown can finish it.
+			deliverCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), apiTimeout)
+			sess.deliverAll(deliverCtx, data)
+			cancel()
+			sess.resetTx()
 			_ = sess.conn.SetDeadline(time.Now().Add(2 * time.Minute))
 		case "RSET":
-			sess.from = ""
-			sess.recipients = sess.recipients[:0]
+			sess.resetTx()
 			sess.writeLine("250 2.1.5 OK")
 		case "NOOP":
 			sess.writeLine("250 2.0.0 OK")
@@ -299,6 +365,8 @@ func (s *session) writeLine(format string, args ...interface{}) {
 
 func (s *session) readData() ([]byte, error) {
 	var buf bytes.Buffer
+	oversized := false
+	totalRead := 0
 	for {
 		line, err := s.r.ReadBytes('\n')
 		if err != nil {
@@ -307,30 +375,33 @@ func (s *session) readData() ([]byte, error) {
 		if bytes.Equal(line, []byte(".\r\n")) || bytes.Equal(line, []byte(".\n")) {
 			break
 		}
-		// dot-stuffing
+		// dot-stuffing (RFC 5321 Section 4.5.2)
 		if len(line) > 0 && line[0] == '.' {
 			line = line[1:]
 		}
+		totalRead += len(line)
+		if totalRead > maxDiscardBytes {
+			return nil, fmt.Errorf("message exceeds hard disconnect limit %d bytes", maxDiscardBytes)
+		}
+		if oversized {
+			continue
+		}
 		if buf.Len()+len(line) > maxMessageBytes {
-			// 仍然继续读完，但只丢弃后续，最后再返回错误
-			return nil, fmt.Errorf("message exceeds %d bytes", maxMessageBytes)
+			oversized = true
+			buf.Reset()
+			continue
 		}
 		buf.Write(line)
+	}
+	if oversized {
+		return nil, errMessageTooLarge
 	}
 	return buf.Bytes(), nil
 }
 
 func (s *session) deliverAll(ctx context.Context, raw []byte) {
-	msg, parseErr := mail.ReadMessage(bytes.NewReader(raw))
-	var sender, subject, bodyText, bodyHTML string
-	if parseErr == nil {
-		sender = msg.Header.Get("From")
-		subject = msg.Header.Get("Subject")
-		bodyText, bodyHTML = extractBodies(msg)
-	}
-	if sender == "" {
-		sender = s.from
-	}
+	sender, subject, bodyText, bodyHTML := parseEmail(raw, s.from)
+	rawUTF8 := sanitizeUTF8(string(raw))
 
 	rcpts := make([]string, 0, len(s.recipients))
 	for _, r := range s.recipients {
@@ -344,7 +415,7 @@ func (s *session) deliverAll(ctx context.Context, raw []byte) {
 			Subject:    subject,
 			BodyText:   bodyText,
 			BodyHTML:   bodyHTML,
-			Raw:        string(raw),
+			Raw:        rawUTF8,
 		})
 		if err != nil {
 			log.Printf("deliver-batch: %v", err)
@@ -369,7 +440,7 @@ func (s *session) deliverAll(ctx context.Context, raw []byte) {
 			Subject:   subject,
 			BodyText:  bodyText,
 			BodyHTML:  bodyHTML,
-			Raw:       string(raw),
+			Raw:       rawUTF8,
 		}
 		if err := s.srv.deliver(ctx, payload); err != nil {
 			log.Printf("deliver %s: %v", rcpt, err)
@@ -490,56 +561,255 @@ func readAndDrain(r io.Reader, limit int64) ([]byte, error) {
 	return kept.Bytes(), nil
 }
 
-func extractBodies(msg *mail.Message) (string, string) {
-	mediaType, params, err := mime.ParseMediaType(msg.Header.Get("Content-Type"))
-	if err == nil && strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
-		return extractMultipart(msg.Body, params["boundary"])
+// parseEmail extracts headers and decoded text/HTML bodies with strict depth,
+// part count, and byte budgets so malformed or deeply nested MIME cannot exhaust CPU/memory.
+func parseEmail(raw []byte, fallbackFrom string) (sender, subject, bodyText, bodyHTML string) {
+	msg, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err == nil {
+		sender = decodeHeader(msg.Header.Get("From"))
+		subject = decodeHeader(msg.Header.Get("Subject"))
+		budget := &parseBudget{remainingBytes: maxMessageBytes, maxParts: maxMultipartParts}
+		bodyText, bodyHTML = extractBodies(msg, budget)
 	}
-	body, _ := io.ReadAll(io.LimitReader(msg.Body, maxMessageBytes))
-	if strings.EqualFold(mediaType, "text/html") {
-		return "", string(body)
+	if sender == "" {
+		sender = fallbackFrom
 	}
-	return string(body), ""
+	return truncateRunes(sanitizeUTF8(sender), maxSenderRunes),
+		truncateRunes(sanitizeUTF8(subject), maxSubjectRunes),
+		sanitizeUTF8(bodyText),
+		sanitizeUTF8(bodyHTML)
 }
 
-func extractMultipart(r io.Reader, boundary string) (string, string) {
+func truncateRunes(s string, max int) string {
+	if max <= 0 || utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	n := 0
+	for i := range s {
+		if n == max {
+			return s[:i]
+		}
+		n++
+	}
+	return s
+}
+
+type parseBudget struct {
+	remainingBytes int64
+	parts          int
+	maxParts       int
+}
+
+func (b *parseBudget) readLimited(r io.Reader) []byte {
+	if b.remainingBytes <= 0 {
+		return nil
+	}
+	data, _ := io.ReadAll(io.LimitReader(r, b.remainingBytes))
+	b.remainingBytes -= int64(len(data))
+	return data
+}
+
+func decodeHeader(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	dec := &mime.WordDecoder{CharsetReader: charsetReader}
+	decoded, err := dec.DecodeHeader(raw)
+	if err != nil {
+		return raw
+	}
+	return decoded
+}
+
+func charsetReader(charset string, input io.Reader) (io.Reader, error) {
+	switch strings.ToLower(strings.TrimSpace(charset)) {
+	case "", "utf-8", "utf8", "us-ascii", "ascii":
+		return input, nil
+	case "iso-8859-1", "latin1", "latin-1", "iso_8859-1":
+		data, err := io.ReadAll(io.LimitReader(input, maxMessageBytes))
+		if err != nil {
+			return nil, err
+		}
+		return strings.NewReader(decodeLatin1(data)), nil
+	case "windows-1252", "cp1252":
+		data, err := io.ReadAll(io.LimitReader(input, maxMessageBytes))
+		if err != nil {
+			return nil, err
+		}
+		return strings.NewReader(decodeWindows1252(data)), nil
+	default:
+		// Return original stream for unsupported charsets rather than failing header decoding.
+		return input, nil
+	}
+}
+
+var cp1252Extra = [32]rune{
+	0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+	0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+	0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+	0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+}
+
+func decodeLatin1(data []byte) string {
+	var b strings.Builder
+	b.Grow(len(data) * 2)
+	for _, c := range data {
+		b.WriteRune(rune(c))
+	}
+	return b.String()
+}
+
+func decodeWindows1252(data []byte) string {
+	var b strings.Builder
+	b.Grow(len(data) * 2)
+	for _, c := range data {
+		if c >= 0x80 && c <= 0x9F {
+			b.WriteRune(cp1252Extra[c-0x80])
+		} else {
+			b.WriteRune(rune(c))
+		}
+	}
+	return b.String()
+}
+
+func decodeTransferAndCharset(r io.Reader, transferEncoding, charset string, budget *parseBudget) string {
+	var decodedReader io.Reader = r
+	switch strings.ToLower(strings.TrimSpace(transferEncoding)) {
+	case "base64":
+		raw := budget.readLimited(r)
+		cleaned := stripASCIIWhitespace(raw)
+		out, err := base64.StdEncoding.DecodeString(string(cleaned))
+		if err != nil {
+			out, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(string(cleaned), "="))
+			if err != nil {
+				out = raw
+			}
+		}
+		return convertCharset(out, charset)
+	case "quoted-printable":
+		decodedReader = quotedprintable.NewReader(r)
+	}
+	data := budget.readLimited(decodedReader)
+	return convertCharset(data, charset)
+}
+
+func stripASCIIWhitespace(in []byte) []byte {
+	out := make([]byte, 0, len(in))
+	for _, c := range in {
+		if c != ' ' && c != '\t' && c != '\r' && c != '\n' {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func convertCharset(data []byte, charset string) string {
+	switch strings.ToLower(strings.TrimSpace(charset)) {
+	case "iso-8859-1", "latin1", "latin-1", "iso_8859-1":
+		return decodeLatin1(data)
+	case "windows-1252", "cp1252":
+		return decodeWindows1252(data)
+	default:
+		return string(data)
+	}
+}
+
+func sanitizeUTF8(s string) string {
+	if s == "" {
+		return ""
+	}
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "\uFFFD")
+	}
+	if strings.IndexByte(s, 0) >= 0 {
+		s = strings.ReplaceAll(s, "\x00", "")
+	}
+	return s
+}
+
+func isAttachment(disposition string) bool {
+	if disposition == "" {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(disposition)
+	if err != nil {
+		return strings.HasPrefix(strings.ToLower(strings.TrimSpace(disposition)), "attachment")
+	}
+	return strings.EqualFold(mediaType, "attachment")
+}
+
+func extractBodies(msg *mail.Message, budget *parseBudget) (string, string) {
+	ct := msg.Header.Get("Content-Type")
+	mediaType, params, err := mime.ParseMediaType(ct)
+	if err != nil {
+		mediaType = "text/plain"
+		params = nil
+	}
+	mediaType = strings.ToLower(mediaType)
+	if strings.HasPrefix(mediaType, "multipart/") {
+		return extractMultipart(msg.Body, params["boundary"], 0, budget)
+	}
+	if isAttachment(msg.Header.Get("Content-Disposition")) {
+		return "", ""
+	}
+	body := decodeTransferAndCharset(msg.Body, msg.Header.Get("Content-Transfer-Encoding"), params["charset"], budget)
+	if mediaType == "text/html" {
+		return "", body
+	}
+	return body, ""
+}
+
+func extractMultipart(r io.Reader, boundary string, depth int, budget *parseBudget) (string, string) {
+	if depth >= maxMultipartDepth || budget.remainingBytes <= 0 || budget.parts >= budget.maxParts {
+		return "", ""
+	}
 	if boundary == "" {
-		body, _ := io.ReadAll(io.LimitReader(r, maxMessageBytes))
-		return string(body), ""
+		return string(budget.readLimited(r)), ""
 	}
 	var textBody, htmlBody string
 	mr := multipart.NewReader(r, boundary)
 	for {
-		part, err := mr.NextPart()
-		if err == io.EOF {
+		if budget.parts >= budget.maxParts || budget.remainingBytes <= 0 {
 			break
 		}
+		part, err := mr.NextPart()
 		if err != nil {
 			break
 		}
-		mediaType, params, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
+		budget.parts++
+		ct := part.Header.Get("Content-Type")
+		mediaType, params, parseErr := mime.ParseMediaType(ct)
+		if parseErr != nil {
+			mediaType = "text/plain"
+			params = nil
+		}
 		mediaType = strings.ToLower(mediaType)
 		if strings.HasPrefix(mediaType, "multipart/") {
-			nt, nh := extractMultipart(part, params["boundary"])
+			nt, nh := extractMultipart(part, params["boundary"], depth+1, budget)
 			if textBody == "" {
 				textBody = nt
 			}
 			if htmlBody == "" {
 				htmlBody = nh
 			}
+			_ = part.Close()
 			continue
 		}
-		body, _ := io.ReadAll(io.LimitReader(part, maxMessageBytes))
+		if isAttachment(part.Header.Get("Content-Disposition")) {
+			_ = part.Close()
+			continue
+		}
 		switch mediaType {
 		case "text/plain":
 			if textBody == "" {
-				textBody = string(body)
+				textBody = decodeTransferAndCharset(part, part.Header.Get("Content-Transfer-Encoding"), params["charset"], budget)
 			}
 		case "text/html":
 			if htmlBody == "" {
-				htmlBody = string(body)
+				htmlBody = decodeTransferAndCharset(part, part.Header.Get("Content-Transfer-Encoding"), params["charset"], budget)
 			}
 		}
+		_ = part.Close()
 	}
 	return textBody, htmlBody
 }

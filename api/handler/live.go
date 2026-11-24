@@ -52,7 +52,11 @@ func (h *LiveHandler) Events(c *gin.Context) {
 		return
 	}
 
-	events, cancel := h.hub.Subscribe(id)
+	events, cancel, ok := h.hub.Subscribe(account.ID, id)
+	if !ok {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many active live connections"})
+		return
+	}
 	defer cancel()
 
 	w := c.Writer

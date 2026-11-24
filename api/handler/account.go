@@ -1,14 +1,17 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"tempmail/middleware"
+	"tempmail/model"
 	"tempmail/store"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 )
 
 type AccountHandler struct {
@@ -21,7 +24,7 @@ func NewAccountHandler(s *store.Store) *AccountHandler {
 
 // POST /public/key-login - API Key 登录入口，可由后台开关关闭。
 func (h *AccountHandler) KeyLogin(c *gin.Context) {
-	keyLogin, err := h.store.GetSetting(c.Request.Context(), "key_login_enabled")
+	keyLogin, _ := h.store.GetSetting(c.Request.Context(), "key_login_enabled")
 
 	var req struct {
 		APIKey string `json:"api_key" binding:"required"`
@@ -52,9 +55,7 @@ func (h *AccountHandler) KeyLogin(c *gin.Context) {
 
 // POST /api/admin/accounts - 创建账号（管理员）
 func (h *AccountHandler) Create(c *gin.Context) {
-	var req struct {
-		Username string `json:"username" binding:"required,min=2,max=64"`
-	}
+	var req model.CreateAccountReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -98,16 +99,28 @@ func (h *AccountHandler) List(c *gin.Context) {
 	})
 }
 
-// DELETE /api/admin/accounts/:id - 删除账号（管理员）
+// DELETE /api/admin/accounts/:id - 删除账号（管理员，禁止自删和删除管理员）
 func (h *AccountHandler) Delete(c *gin.Context) {
+	actor := middleware.GetAccount(c)
 	id, err := parseUUID(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid account id"})
 		return
 	}
+	if actor != nil && actor.ID == id {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "不能删除当前登录账户"})
+		return
+	}
 
 	if err := h.store.DeleteAccount(c.Request.Context(), id); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		switch {
+		case errors.Is(err, store.ErrCannotDeleteAdmin):
+			c.JSON(http.StatusForbidden, gin.H{"error": "不能删除管理员账户"})
+		case errors.Is(err, pgx.ErrNoRows):
+			c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
 		return
 	}
 

@@ -1,7 +1,7 @@
 // 验证码识别：优先匹配关键词附近的码，其次是主题/正文中独立的 4–8 位数字
 
-const KEYWORDS = /(验证码|校验码|动态码|确认码|激活码|驗證碼|verification code|security code|one[- ]time (?:pass)?code|login code|your code|code is|code:|passcode|OTP|PIN)/i
-const NEAR = /[:：\s]*([A-Z0-9]{4,8}|\d{3}[\s-]\d{3})\b/i
+const KEYWORDS = /(验证码|校验码|动态码|确认码|激活码|驗證碼|\b(?:verification code|security code|one[- ]time (?:pass)?code|login code|your code|code is|passcode|otp|pin)\b|\bcode\s*[:：])/i
+const NEAR = /^[\s:：\-]*(?:is\s+|为\s*|是\s*)?\b([A-Z0-9]{4,8}|\d{3}[\s-]\d{3})\b/i
 const DIGITS = /(?<![\d#.:/\-])(\d{4,8})(?![\d.:/\-])/g
 
 // 排除看起来像年份、日期、价格的数字

@@ -1,11 +1,10 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 
 // 定时轮询：页面隐藏时暂停，重新可见时立即补一次
-export function usePoller(fn, interval, { immediate = false } = {}) {
+export function usePoller(fn, interval) {
   let timer = null
   let running = false
   const busy = ref(false)
-  const lastRun = ref(0)
 
   async function tick() {
     if (running) return
@@ -13,7 +12,6 @@ export function usePoller(fn, interval, { immediate = false } = {}) {
     busy.value = true
     try {
       await fn()
-      lastRun.value = Date.now()
     } catch {
       /* 轮询失败静默处理，下次重试 */
     } finally {
@@ -43,7 +41,6 @@ export function usePoller(fn, interval, { immediate = false } = {}) {
 
   onMounted(() => {
     document.addEventListener('visibilitychange', onVisibility)
-    if (immediate) tick()
     start()
   })
   onBeforeUnmount(() => {
@@ -51,7 +48,7 @@ export function usePoller(fn, interval, { immediate = false } = {}) {
     document.removeEventListener('visibilitychange', onVisibility)
   })
 
-  return { busy, lastRun, tick, start, stop }
+  return { busy, tick }
 }
 
 // 每隔一段时间刷新的“当前时间”，用于倒计时显示

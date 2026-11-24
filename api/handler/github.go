@@ -56,7 +56,7 @@ func (h *GitHubHandler) Start(c *gin.Context) {
 		return
 	}
 	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie(gitHubStateCookie, state, 600, "/", "", false, true)
+	c.SetCookie(gitHubStateCookie, state, 600, "/", "", isHTTPS(c), true)
 
 	q := url.Values{}
 	q.Set("client_id", cfg.clientID)
@@ -84,7 +84,8 @@ func (h *GitHubHandler) Callback(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid oauth state"})
 		return
 	}
-	c.SetCookie(gitHubStateCookie, "", -1, "/", "", false, true)
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(gitHubStateCookie, "", -1, "/", "", isHTTPS(c), true)
 
 	if oauthErr := c.Query("error"); oauthErr != "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "GitHub OAuth error: " + oauthErr})
@@ -129,7 +130,7 @@ func (h *GitHubHandler) Callback(c *gin.Context) {
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.String(http.StatusOK, fmt.Sprintf(`<!doctype html><html><body><script>
 localStorage.setItem('tm_apikey', %s);
-localStorage.setItem('tm_account', %s);
+localStorage.setItem('tm_account', JSON.stringify(%s));
 location.replace('/');
 </script></body></html>`, string(apiKeyJSON), string(accountJSON)))
 }

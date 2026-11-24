@@ -48,7 +48,7 @@ set -e
 
 API_URL="${API_URL:-http://api:8080}"
 DOMAIN_MAP="${DOMAIN_MAP:-/var/spool/postfix/virtual_domains}"
-DOMAINS=$(curl -sf "$API_URL/internal/domains" 2>/dev/null || echo "")
+DOMAINS=$(curl -sf --connect-timeout 5 --max-time 15 "$API_URL/internal/domains" 2>/dev/null || echo "")
 if [ -n "$DOMAINS" ]; then
     if echo "$DOMAINS" | python3 -c '
 import json
@@ -164,7 +164,13 @@ chmod +x /usr/local/bin/sync-domains.sh
 /usr/local/bin/sync-domains.sh || true
 (while true; do sleep 60; /usr/local/bin/sync-domains.sh; done) &
 
-postconf -e "myhostname=${SMTP_HOSTNAME:-mail.example.com}"
+SMTP_HOST="${SMTP_HOSTNAME:-mail.example.com}"
+SMTP_DOMAIN="${SMTP_HOST#*.}"
+if [ "$SMTP_DOMAIN" = "$SMTP_HOST" ] || [ -z "$SMTP_DOMAIN" ]; then
+    SMTP_DOMAIN="$SMTP_HOST"
+fi
+postconf -e "myhostname=${SMTP_HOST}"
+postconf -e "mydomain=${SMTP_DOMAIN}"
 postconf -e "virtual_mailbox_domains=regexp:${DOMAIN_MAP}"
 postconf -e "virtual_transport=lmtp:unix:private/mail-receiver"
 
@@ -200,12 +206,28 @@ case "$SMTPD_PROCESS_LIMIT" in
 esac
 postconf -M "smtp/inet=smtp inet n - n - $SMTPD_PROCESS_LIMIT smtpd"
 
-trap "kill $RECEIVER_PID 2>/dev/null; exit 0" TERM INT
+shutdown() {
+    postfix stop 2>/dev/null || true
+    kill "$RECEIVER_PID" 2>/dev/null || true
+    wait "$RECEIVER_PID" 2>/dev/null || true
+    exit 0
+}
+trap shutdown TERM INT
 
 postfix start
 
-# 监控 receiver 进程：退出则停止 postfix，让容器重启
-wait $RECEIVER_PID
-echo "mail-receiver exited, stopping postfix" >&2
-postfix stop
-exit 1
+# 同时监控 mail-receiver 与 postfix master：任一异常退出则整体退出，交由容器重启
+while true; do
+    if ! kill -0 "$RECEIVER_PID" 2>/dev/null; then
+        echo "mail-receiver exited, stopping postfix" >&2
+        postfix stop 2>/dev/null || true
+        exit 1
+    fi
+    if ! postfix status >/dev/null 2>&1; then
+        echo "postfix exited, stopping mail-receiver" >&2
+        kill "$RECEIVER_PID" 2>/dev/null || true
+        wait "$RECEIVER_PID" 2>/dev/null || true
+        exit 1
+    fi
+    sleep 2
+done

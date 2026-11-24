@@ -7,7 +7,6 @@ const props = defineProps({
   title: { type: String, default: '' },
   size: { type: String, default: '' },
   icon: { type: [Object, Function], default: null },
-  dismissible: { type: Boolean, default: true },
 })
 const emit = defineEmits(['close'])
 
@@ -16,7 +15,7 @@ let lastFocus = null
 const titleId = `m-${Math.random().toString(36).slice(2, 8)}`
 
 function close() {
-  if (props.dismissible) emit('close')
+  emit('close')
 }
 
 function onKey(e) {
@@ -63,7 +62,7 @@ onBeforeUnmount(() => {
         <div ref="panel" class="modal" :class="size" role="dialog" aria-modal="true" :aria-labelledby="titleId" tabindex="-1">
           <div class="modal-h">
             <h2 :id="titleId"><component :is="icon" v-if="icon" aria-hidden="true" />{{ title }}</h2>
-            <button v-if="dismissible" type="button" class="icon-btn" aria-label="关闭" @click="close"><X /></button>
+            <button type="button" class="icon-btn" aria-label="关闭" @click="close"><X /></button>
           </div>
           <div class="modal-b"><slot /></div>
           <div v-if="$slots.footer" class="modal-f"><slot name="footer" /></div>

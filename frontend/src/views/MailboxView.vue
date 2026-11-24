@@ -1,8 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ArrowLeft, RefreshCw, Search, Trash2, MailOpen, Inbox, Mail, TimerReset, Radio } from '@lucide/vue'
-import CopyButton from '../components/ui/CopyButton.vue'
+import { ArrowLeft, RefreshCw, Search, Trash2, MailOpen, Inbox, Mail, TimerReset, Radio, Copy, Check } from '@lucide/vue'
 import EmptyState from '../components/ui/EmptyState.vue'
 import TtlCell from '../components/mail/TtlCell.vue'
 import EmailReader from '../components/mail/EmailReader.vue'
@@ -10,7 +9,7 @@ import { api } from '../api/client'
 import { confirm, copyText, toast } from '../composables/feedback'
 import { extendMailbox, mailboxBus, mailboxesChanged } from '../composables/mailboxBus'
 import { useMailboxLive } from '../composables/live'
-import { checkExpiry } from '../composables/expiryReminder'
+import { checkExpiry, forgetExpiry } from '../composables/expiryReminder'
 import { useNow, usePoller } from '../composables/poller'
 import { initial, isExpired, senderName, timeAgo } from '../utils/format'
 import { extractOtp } from '../utils/otp'
@@ -39,15 +38,26 @@ const filtered = computed(() => {
 
 const decorate = list => (list || []).map(e => ({ ...e, otp: extractOtp({ subject: e.subject }) }))
 
-async function loadMailbox() {
-  const list = await api.listMailboxes()
-  const found = (list || []).find(m => String(m.id) === id.value)
-  mailbox.value = found && !isExpired(found) ? found : null
-  missing.value = !mailbox.value
+async function loadMailbox(cur = id.value) {
+  try {
+    const found = await api.getMailbox(cur)
+    if (cur !== id.value) return
+    mailbox.value = found && !isExpired(found) ? found : null
+    missing.value = !mailbox.value
+  } catch (e) {
+    if (cur !== id.value) return
+    if (e.status === 404 || e.status === 400) {
+      mailbox.value = null
+      missing.value = true
+      return
+    }
+    throw e
+  }
 }
 
-async function loadEmails({ silent = false } = {}) {
-  const fresh = decorate(await api.listEmails(id.value))
+async function loadEmails({ silent = false, targetId = id.value } = {}) {
+  const fresh = decorate(await api.listEmails(targetId))
+  if (targetId !== id.value) return
   if (silent) {
     const known = new Set(emails.value.map(e => e.id))
     const added = fresh.filter(e => !known.has(e.id))
@@ -62,17 +72,22 @@ async function loadEmails({ silent = false } = {}) {
 }
 
 async function loadAll() {
+  const cur = id.value
   loading.value = true
   missing.value = false
+  mailbox.value = null
   emails.value = []
   unseen.value = new Set()
   try {
-    await Promise.all([loadMailbox(), loadEmails()])
+    await loadMailbox(cur)
+    if (cur !== id.value || missing.value) return
+    await loadEmails({ targetId: cur })
   } catch (e) {
+    if (cur !== id.value) return
     if (e.status === 404 || e.status === 400) missing.value = true
     else toast.error(`加载失败：${e.message}`)
   } finally {
-    loading.value = false
+    if (cur === id.value) loading.value = false
   }
 }
 
@@ -80,11 +95,22 @@ async function loadAll() {
 const live = useMailboxLive(id, {
   onEmail: () => loadEmails({ silent: true }).catch(() => {}),
   onMailbox: mb => { if (mailbox.value && mb?.id === mailbox.value.id) mailbox.value = { ...mailbox.value, ...mb } },
-  onExpired: () => { mailbox.value = null; missing.value = true },
-  onMissing: () => { mailbox.value = null; missing.value = true },
+  onExpired: () => { forgetExpiry(id.value); mailbox.value = null; missing.value = true },
+  onMissing: () => { forgetExpiry(id.value); mailbox.value = null; missing.value = true },
 })
 const isLive = computed(() => live.status.value === 'live')
-const poller = usePoller(() => (missing.value || isLive.value ? null : loadEmails({ silent: true })), 8000)
+let liveTicks = 0
+usePoller(() => {
+  if (missing.value) return null
+  // SSE 断开时每 8 秒轮询；SSE 在线时每 8 轮（约 64 秒）对账一次，防实时推送队列满丢事件
+  if (isLive.value) {
+    if (++liveTicks < 8) return null
+    liveTicks = 0
+  } else {
+    liveTicks = 0
+  }
+  return loadEmails({ silent: true })
+}, 8000)
 
 const extending = ref(false)
 async function extend() {
@@ -99,8 +125,17 @@ watch(() => mailboxBus.updated, u => {
   if (u && mailbox.value && u.mailbox.id === mailbox.value.id) mailbox.value = { ...mailbox.value, ...u.mailbox }
 })
 
+const refreshing = ref(false)
 async function refresh() {
-  await poller.tick()
+  if (refreshing.value || missing.value) return
+  refreshing.value = true
+  try {
+    await loadEmails({ silent: false })
+  } catch (e) {
+    toast.error(`刷新失败：${e.message}`)
+  } finally {
+    refreshing.value = false
+  }
 }
 
 function openEmail(e) {
@@ -117,7 +152,12 @@ function onDeleted(eid) {
   back()
 }
 
+const deletingEmails = ref(new Set())
+const deletingMailbox = ref(false)
+
 async function removeEmail(e) {
+  if (deletingEmails.value.has(e.id)) return
+  deletingEmails.value = new Set(deletingEmails.value).add(e.id)
   try {
     await api.deleteEmail(id.value, e.id)
     emails.value = emails.value.filter(x => x.id !== e.id)
@@ -125,11 +165,15 @@ async function removeEmail(e) {
     if (emailId.value === e.id) back()
   } catch (err) {
     toast.error(`删除失败：${err.message}`)
+  } finally {
+    const next = new Set(deletingEmails.value)
+    next.delete(e.id)
+    deletingEmails.value = next
   }
 }
 
 async function removeMailbox() {
-  if (!mailbox.value) return
+  if (!mailbox.value || deletingMailbox.value) return
   const ok = await confirm({
     title: '删除邮箱',
     message: `确定删除 ${mailbox.value.full_address}？`,
@@ -138,13 +182,17 @@ async function removeMailbox() {
     danger: true,
   })
   if (!ok) return
+  deletingMailbox.value = true
   try {
     await api.deleteMailbox(id.value)
+    forgetExpiry(id.value)
     toast.success('邮箱已删除')
     mailboxesChanged()
     router.replace({ name: 'mailboxes' })
   } catch (e) {
     toast.error(`删除失败：${e.message}`)
+  } finally {
+    deletingMailbox.value = false
   }
 }
 
@@ -164,14 +212,27 @@ watch(emailId, v => {
 // 停留在页面期间到期，同样按已删除处理
 watch(now, t => {
   if (mailbox.value && isExpired(mailbox.value, t)) {
+    forgetExpiry(id.value)
     mailbox.value = null
     missing.value = true
   } else if (mailbox.value) checkExpiry([mailbox.value], t)
 })
 
+const addrCopied = ref(false)
+let addrCopyTimer = null
+async function copyAddress() {
+  if (!mailbox.value?.full_address) return
+  if (await copyText(mailbox.value.full_address, '已复制邮箱地址')) {
+    addrCopied.value = true
+    clearTimeout(addrCopyTimer)
+    addrCopyTimer = setTimeout(() => { addrCopied.value = false }, 1400)
+  }
+}
+
 watch(id, loadAll, { immediate: true })
 onMounted(() => document.addEventListener('visibilitychange', onVisible))
 onBeforeUnmount(() => {
+  clearTimeout(addrCopyTimer)
   document.removeEventListener('visibilitychange', onVisible)
   document.title = document.title.replace(/^\(\d+\)\s*/, '') || baseTitle
 })
@@ -184,10 +245,21 @@ onBeforeUnmount(() => {
         <RouterLink :to="{ name: 'mailboxes' }" class="crumb"><ArrowLeft aria-hidden="true" />我的邮箱</RouterLink>
         <h1 class="addr-title">
           <span v-if="loading && !mailbox" class="skel" style="width: 260px; height: 22px" />
-          <template v-else>
-            <span class="mono ellipsis">{{ mailbox?.full_address || '邮箱不存在' }}</span>
-            <CopyButton v-if="mailbox" :text="mailbox.full_address" label="复制地址" />
-          </template>
+          <button
+            v-else-if="mailbox"
+            type="button"
+            class="addr-copy"
+            :class="{ copied: addrCopied }"
+            title="点击复制邮箱地址"
+            aria-label="点击复制邮箱地址"
+            @click="copyAddress"
+          >
+            <span class="mono ellipsis">{{ mailbox.full_address }}</span>
+            <span class="addr-pill" aria-hidden="true">
+              <component :is="addrCopied ? Check : Copy" />{{ addrCopied ? '已复制' : '复制' }}
+            </span>
+          </button>
+          <span v-else class="mono ellipsis">邮箱不存在</span>
         </h1>
         <p v-if="mailbox" class="sub-line">
           <TtlCell :mailbox="mailbox" :now="now" compact />
@@ -198,13 +270,13 @@ onBeforeUnmount(() => {
         </p>
       </div>
       <div v-if="mailbox" class="acts">
-        <button type="button" class="btn btn-secondary" :disabled="poller.busy.value" @click="refresh">
-          <RefreshCw :class="{ spin: poller.busy.value }" aria-hidden="true" />刷新
+        <button type="button" class="btn btn-secondary" :disabled="refreshing" @click="refresh">
+          <RefreshCw :class="{ spin: refreshing }" aria-hidden="true" />刷新
         </button>
         <button v-if="mailbox.expires_at" type="button" class="btn btn-secondary" :disabled="extending" @click="extend">
           <TimerReset :class="{ spin: extending }" aria-hidden="true" />续期
         </button>
-        <button type="button" class="btn btn-danger" @click="removeMailbox"><Trash2 aria-hidden="true" />删除邮箱</button>
+        <button type="button" class="btn btn-danger" :disabled="deletingMailbox" @click="removeMailbox"><Trash2 aria-hidden="true" />{{ deletingMailbox ? '删除中…' : '删除邮箱' }}</button>
       </div>
     </header>
 
@@ -238,7 +310,7 @@ onBeforeUnmount(() => {
             v-for="e in filtered"
             :key="e.id"
             class="mi"
-            :class="{ on: e.id === emailId, unread: unseen.has(e.id) }"
+            :class="{ on: e.id === emailId, unread: unseen.has(e.id), 'has-otp': !!e.otp }"
           >
             <button type="button" class="mi-btn" :aria-current="e.id === emailId ? 'true' : undefined" @click="openEmail(e)">
               <span class="av" aria-hidden="true">{{ initial(e.sender) }}</span>
@@ -260,7 +332,7 @@ onBeforeUnmount(() => {
               >
                 {{ e.otp }}
               </button>
-              <button type="button" class="icon-btn icon-btn-sm danger" aria-label="删除邮件" title="删除邮件" @click="removeEmail(e)">
+              <button type="button" class="icon-btn icon-btn-sm danger" aria-label="删除邮件" title="删除邮件" :disabled="deletingEmails.has(e.id)" @click="removeEmail(e)">
                 <Trash2 aria-hidden="true" />
               </button>
             </div>
@@ -295,6 +367,22 @@ onBeforeUnmount(() => {
 .inbox-page { display: grid; gap: 16px; }
 .addr-title { min-width: 0; }
 .addr-title .mono { font-family: var(--mono); font-size: 18px; font-weight: 600; }
+.addr-copy {
+  display: inline-flex; align-items: center; gap: 8px; max-width: 100%; min-width: 0;
+  padding: 3px 8px 3px 6px; margin-left: -6px; border: 1px solid transparent;
+  border-radius: var(--r-sm); background: none; text-align: left;
+  transition: background var(--ease), border-color var(--ease);
+}
+.addr-copy:hover { background: var(--tint); border-color: color-mix(in oklab, var(--fill-edge) 45%, var(--border)); }
+.addr-pill {
+  display: inline-flex; align-items: center; gap: 4px; flex: none;
+  padding: 2px 7px; border-radius: 999px; font-size: 11px; font-weight: 500;
+  background: var(--bg); color: var(--text-2); border: 1px solid var(--border);
+  transition: background var(--ease), color var(--ease), border-color var(--ease);
+}
+.addr-pill svg { width: 12px; height: 12px; }
+.addr-copy:hover .addr-pill { background: var(--surface); color: var(--accent); border-color: var(--fill-edge); }
+.addr-copy.copied .addr-pill { background: var(--ok-bg); color: var(--ok); border-color: color-mix(in oklab, var(--ok) 35%, var(--border)); }
 .sub-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 
 .split { display: grid; grid-template-columns: minmax(280px, 360px) 1fr; min-height: calc(100vh - 200px); overflow: hidden; }
@@ -307,31 +395,42 @@ onBeforeUnmount(() => {
 .pad { padding: 14px; }
 
 .mlist { list-style: none; padding: 0; overflow-y: auto; flex: 1; max-height: calc(100vh - 252px); }
-.mi { position: relative; display: flex; align-items: center; border-bottom: 1px solid var(--border); transition: background var(--ease); }
+.mi { position: relative; border-bottom: 1px solid var(--border); transition: background var(--ease); }
 .mi:hover { background: var(--tint); }
 .mi.on { background: var(--tint); box-shadow: inset 3px 0 0 var(--accent); }
 .mi-btn {
-  flex: 1; min-width: 0; display: flex; gap: 10px; align-items: center; text-align: left;
-  padding: 12px 8px 12px 14px; border: 0; background: none;
+  width: 100%; min-width: 0; display: flex; gap: 10px; align-items: flex-start; text-align: left;
+  padding: 11px 12px 11px 14px; border: 0; background: none;
 }
 .av {
   width: 32px; height: 32px; border-radius: 50%; flex: none; display: grid; place-items: center;
-  font-weight: 600; font-size: 13px; background: var(--tint-strong); color: var(--on-fill);
+  margin-top: 2px; font-weight: 600; font-size: 13px; background: var(--tint-strong); color: var(--on-fill);
 }
 [data-theme="dark"] .av { color: var(--text); }
-.mi-t { display: grid; gap: 1px; min-width: 0; flex: 1; }
-.mi-f { display: flex; gap: 8px; font-weight: 600; font-size: 13px; min-width: 0; }
+.mi-t { display: grid; gap: 3px; min-width: 0; flex: 1; }
+.mi-f { display: flex; align-items: baseline; gap: 8px; font-weight: 600; font-size: 13px; min-width: 0; }
 .mi-f time { margin-left: auto; font-weight: 400; color: var(--text-3); font-size: 12px; flex: none; }
 .mi.unread .mi-f > span::before {
   content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%;
   background: var(--accent); margin-right: 6px; vertical-align: 1px;
 }
-.mi-s { font-size: 13px; color: var(--text-2); }
-.mi-acts { display: flex; align-items: center; gap: 4px; padding-right: 10px; flex: none; }
-.mi-acts .icon-btn { opacity: 0; }
-.mi:hover .mi-acts .icon-btn, .mi-acts .icon-btn:focus-visible { opacity: 1; }
+.mi-s { font-size: 13px; color: var(--text-2); line-height: 20px; }
+.mi.has-otp .mi-s { padding-right: 72px; }
+.mi:hover .mi-s, .mi:focus-within .mi-s { padding-right: 30px; }
+.mi.has-otp:hover .mi-s, .mi.has-otp:focus-within .mi-s { padding-right: 98px; }
+.mi-acts {
+  position: absolute; right: 10px; bottom: 9px;
+  display: flex; align-items: center; gap: 4px; pointer-events: none;
+}
+.mi-acts > * { pointer-events: auto; }
+.mi-acts .icon-btn { opacity: 0; width: 0; overflow: hidden; transition: opacity var(--ease), width var(--ease), background var(--ease), color var(--ease); }
+.mi:hover .mi-acts .icon-btn, .mi:focus-within .mi-acts .icon-btn { opacity: 1; width: 24px; }
 
-@media (hover: none) { .mi-acts .icon-btn { opacity: 1; } }
+@media (hover: none) {
+  .mi-acts .icon-btn { opacity: 1; width: 24px; }
+  .mi .mi-s { padding-right: 30px; }
+  .mi.has-otp .mi-s { padding-right: 98px; }
+}
 @media (max-width: 900px) {
   .split { grid-template-columns: minmax(0, 1fr); min-height: 0; }
   .list-pane { border-right: 0; }

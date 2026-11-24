@@ -59,7 +59,7 @@ func (h *LinuxDOHandler) Start(c *gin.Context) {
 		return
 	}
 	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie(linuxDOStateCookie, state, 600, "/", "", false, true)
+	c.SetCookie(linuxDOStateCookie, state, 600, "/", "", isHTTPS(c), true)
 
 	q := url.Values{}
 	q.Set("client_id", cfg.clientID)
@@ -86,7 +86,8 @@ func (h *LinuxDOHandler) Callback(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid oauth state"})
 		return
 	}
-	c.SetCookie(linuxDOStateCookie, "", -1, "/", "", false, true)
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(linuxDOStateCookie, "", -1, "/", "", isHTTPS(c), true)
 
 	code := c.Query("code")
 	if code == "" {
@@ -127,7 +128,7 @@ func (h *LinuxDOHandler) Callback(c *gin.Context) {
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.String(http.StatusOK, fmt.Sprintf(`<!doctype html><html><body><script>
 localStorage.setItem('tm_apikey', %s);
-localStorage.setItem('tm_account', %s);
+localStorage.setItem('tm_account', JSON.stringify(%s));
 location.replace('/');
 </script></body></html>`, string(apiKeyJSON), string(accountJSON)))
 }
@@ -162,8 +163,22 @@ func (h *LinuxDOHandler) oauthConfig(c *gin.Context) linuxDOOAuthConfig {
 	return linuxDOOAuthConfig{clientID: clientID, clientSecret: clientSecret, redirectURL: redirectURL}
 }
 
+func firstHeaderValue(raw string) string {
+	if idx := strings.IndexByte(raw, ','); idx >= 0 {
+		raw = raw[:idx]
+	}
+	return strings.TrimSpace(raw)
+}
+
+func isHTTPS(c *gin.Context) bool {
+	if c.Request.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(firstHeaderValue(c.GetHeader("X-Forwarded-Proto")), "https")
+}
+
 func requestBaseURL(c *gin.Context) string {
-	scheme := c.GetHeader("X-Forwarded-Proto")
+	scheme := firstHeaderValue(c.GetHeader("X-Forwarded-Proto"))
 	if scheme == "" {
 		if c.Request.TLS != nil {
 			scheme = "https"
@@ -171,7 +186,7 @@ func requestBaseURL(c *gin.Context) string {
 			scheme = "http"
 		}
 	}
-	host := c.GetHeader("X-Forwarded-Host")
+	host := firstHeaderValue(c.GetHeader("X-Forwarded-Host"))
 	if host == "" {
 		host = c.Request.Host
 	}

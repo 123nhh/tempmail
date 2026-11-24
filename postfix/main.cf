@@ -9,8 +9,8 @@ append_dot_mydomain = no
 smtpd_use_tls = no
 
 # 基本设置
-myhostname = mail.123nhh.xyz
-mydomain = 123nhh.xyz
+myhostname = mail.example.com
+mydomain = example.com
 myorigin = $mydomain
 inet_interfaces = all
 inet_protocols = ipv4
@@ -40,7 +40,7 @@ default_process_limit = 500
 in_flow_delay = 1s
 maximal_queue_lifetime = 1d
 bounce_queue_lifetime = 1d
-message_size_limit = 10240000
+message_size_limit = 10485760
 
 # 并发
 smtp_destination_concurrency_limit = 50

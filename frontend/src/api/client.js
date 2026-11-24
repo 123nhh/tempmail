@@ -48,7 +48,6 @@ const list = d => (Array.isArray(d) ? d : d.data || [])
 export const api = {
   // 公共
   publicSettings: () => request(`${PUBLIC_BASE}/settings`, { auth: false }),
-  publicStats: () => request(`${PUBLIC_BASE}/stats`, { auth: false }),
   keyLogin: apiKey => request(`${PUBLIC_BASE}/key-login`, { method: 'POST', body: { api_key: apiKey }, auth: false }),
   register: body => request(`${PUBLIC_BASE}/register`, { method: 'POST', body, auth: false }),
   oauthUrl: provider => `${PUBLIC_BASE}/auth/${provider}`,
@@ -64,7 +63,9 @@ export const api = {
 
   // 邮箱
   createMailbox: body => request(`${API_BASE}/mailboxes`, { method: 'POST', body: body || {} }).then(d => d.mailbox || d),
+  getMailbox: id => request(`${API_BASE}/mailboxes/${encodeURIComponent(id)}`).then(d => d.mailbox || d),
   listMailboxes: () => request(`${API_BASE}/mailboxes?size=100`).then(list),
+  listMailboxesPage: (page = 1, size = 100) => request(`${API_BASE}/mailboxes?page=${page}&size=${size}`),
   deleteMailbox: id => request(`${API_BASE}/mailboxes/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   extendMailbox: (id, minutes) =>
     request(`${API_BASE}/mailboxes/${encodeURIComponent(id)}/extend`, { method: 'POST', body: minutes ? { minutes } : {} })

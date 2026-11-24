@@ -3,6 +3,7 @@ package handler
 import (
 	"net/http"
 
+	"tempmail/model"
 	"tempmail/store"
 
 	"github.com/gin-gonic/gin"
@@ -25,9 +26,7 @@ func (h *RegisterHandler) Register(c *gin.Context) {
 		return
 	}
 
-	var req struct {
-		Username string `json:"username" binding:"required,min=2,max=64"`
-	}
+	var req model.CreateAccountReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

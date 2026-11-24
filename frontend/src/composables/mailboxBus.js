@@ -6,7 +6,6 @@ import { toast } from './feedback'
 export const mailboxBus = reactive({
   createOpen: false,
   version: 0,
-  lastCreated: null,
   // 最近一次被更新（续期）的邮箱，列表页据此原地替换，不必整页刷新
   updated: null,
 })
@@ -15,8 +14,7 @@ export function openCreateMailbox() {
   mailboxBus.createOpen = true
 }
 
-export function mailboxesChanged(created = null) {
-  if (created) mailboxBus.lastCreated = created
+export function mailboxesChanged() {
   mailboxBus.version++
 }
 
@@ -50,8 +48,4 @@ export async function extendMailbox(mb) {
   } finally {
     extending.delete(mb.id)
   }
-}
-
-export function isExtending(id) {
-  return extending.has(id)
 }

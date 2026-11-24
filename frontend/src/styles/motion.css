@@ -79,11 +79,6 @@
   100% { background: transparent; transform: none; }
 }
 
-/* 骨架屏 → 内容 */
-.fade-enter-active { transition: opacity var(--dur-2) ease; }
-.fade-leave-active { transition: opacity var(--dur-1) ease; }
-.fade-enter-from, .fade-leave-to { opacity: 0; }
-
 /* 空状态图标轻浮动 */
 .empty .ico { animation: float 3.2s ease-in-out infinite; }
 @keyframes float { 50% { transform: translateY(-3px); } }

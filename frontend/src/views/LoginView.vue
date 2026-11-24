@@ -57,8 +57,20 @@ async function doLogin(k = key.value) {
   busy.value = true
   error.value = ''
   try {
-    const acct = await session.login(v)
-    toast.success(`欢迎回来，${acct.username || '用户'}`)
+    let acct
+    if (!keyLogin.value && registered.value?.api_key === v) {
+      session.persist(v, {
+        id: registered.value.id,
+        username: registered.value.username,
+        is_admin: false,
+      })
+      const ok = await session.restore()
+      if (!ok) throw new Error('登录失败，请稍后重试')
+      acct = session.account
+    } else {
+      acct = await session.login(v)
+    }
+    toast.success(`欢迎回来，${acct?.username || '用户'}`)
     go()
   } catch (e) {
     error.value = e.status === 403 ? 'API Key 登录已被管理员关闭' : e.status === 401 ? 'API Key 无效' : e.message

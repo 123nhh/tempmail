@@ -10,7 +10,7 @@ import TtlCell from '../components/mail/TtlCell.vue'
 import { api } from '../api/client'
 import { confirm, toast } from '../composables/feedback'
 import { extendMailbox, mailboxBus, mailboxesChanged, openCreateMailbox, patchMailbox } from '../composables/mailboxBus'
-import { checkExpiry } from '../composables/expiryReminder'
+import { checkExpiry, forgetExpiry } from '../composables/expiryReminder'
 import { useNow } from '../composables/poller'
 import { expiryInfo, formatDate, isExpired } from '../utils/format'
 
@@ -19,6 +19,7 @@ const now = useNow(15000)
 
 const loading = ref(true)
 const allItems = ref([])
+const total = ref(0)
 const items = computed(() => allItems.value.filter(m => !isExpired(m, now.value)))
 const q = ref('')
 const sort = ref('expiry')
@@ -34,7 +35,9 @@ const filtered = computed(() => {
 async function load() {
   loading.value = true
   try {
-    allItems.value = (await api.listMailboxes()) || []
+    const page = await api.listMailboxesPage(1, 100)
+    allItems.value = Array.isArray(page) ? page : (page?.data || [])
+    total.value = typeof page?.total === 'number' ? page.total : allItems.value.length
     checkExpiry(allItems.value)
   } catch (e) {
     toast.error(`加载失败：${e.message}`)
@@ -54,7 +57,9 @@ async function remove(mb) {
   if (!ok) return
   try {
     await api.deleteMailbox(mb.id)
+    forgetExpiry(mb.id)
     allItems.value = allItems.value.filter(m => m.id !== mb.id)
+    if (total.value > 0) total.value--
     toast.success('邮箱已删除')
     mailboxesChanged()
   } catch (e) {
@@ -81,7 +86,10 @@ onMounted(load)
 </script>
 
 <template>
-  <PageHeader title="我的邮箱" :sub="loading ? '加载中…' : `共 ${items.length} 个邮箱，到期后自动删除`">
+  <PageHeader
+    title="我的邮箱"
+    :sub="loading ? '加载中…' : total > allItems.length ? `共 ${total} 个邮箱（当前显示前 ${items.length} 个），到期后自动删除` : `共 ${items.length} 个邮箱，到期后自动删除`"
+  >
     <template #actions>
       <button type="button" class="btn btn-secondary" :disabled="loading" @click="load">
         <RefreshCw :class="{ spin: loading }" aria-hidden="true" />刷新

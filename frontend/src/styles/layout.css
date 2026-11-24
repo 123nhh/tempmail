@@ -144,8 +144,10 @@
 .toast.error > svg { color: #E39A8F; }
 .toast.warn > svg { color: #D9B774; }
 .toast.info > svg { color: var(--fill); }
-[data-theme="dark"] .toast.success > svg { color: var(--ok-bg); filter: none; }
-[data-theme="dark"] .toast > svg { color: color-mix(in oklab, var(--bg) 70%, var(--text)); }
+[data-theme="dark"] .toast.success > svg { color: #436B4E; }
+[data-theme="dark"] .toast.error > svg { color: #A3473B; }
+[data-theme="dark"] .toast.warn > svg { color: #8A6420; }
+[data-theme="dark"] .toast.info > svg { color: #8A6149; }
 .toast button { border: 0; background: none; color: inherit; opacity: 0.6; padding: 2px; display: grid; }
 .toast button:hover { opacity: 1; }
 .toast button svg { width: 14px; height: 14px; }

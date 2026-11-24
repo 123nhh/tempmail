@@ -48,7 +48,7 @@ usePoller(async () => {
     }
   })
   if (changed) await load()
-}, 5000)
+}, 30000)
 
 async function refreshMx() {
   refreshing.value = true
@@ -111,7 +111,7 @@ onMounted(load)
   <section v-if="pending.length" class="card" aria-labelledby="h-pending">
     <div class="card-h">
       <h2 id="h-pending"><Clock aria-hidden="true" />待 MX 验证 · {{ pending.length }}</h2>
-      <span class="sub">后台每 30 秒自动检测，本页每 5 秒刷新状态</span>
+      <span class="sub">后台每 30 秒自动检测，本页每 30 秒刷新状态</span>
     </div>
     <div class="table-wrap">
       <table class="tbl">
@@ -187,7 +187,7 @@ onMounted(load)
   </section>
 
   <AddDomainModal :open="addOpen" @close="addOpen = false" @changed="load" />
-  <MxRegisterModal :open="mxOpen" @close="mxOpen = false" @changed="load" />
+  <MxRegisterModal :open="mxOpen" admin @close="mxOpen = false" @changed="load" />
 </template>
 
 <style scoped>

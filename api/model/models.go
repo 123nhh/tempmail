@@ -77,46 +77,12 @@ type CreateAccountReq struct {
 	Username string `json:"username" binding:"required,min=2,max=64"`
 }
 
-type CreateAccountResp struct {
-	ID       uuid.UUID `json:"id"`
-	Username string    `json:"username"`
-	APIKey   string    `json:"api_key"`
-}
-
-type AddDomainReq struct {
-	Domain string `json:"domain" binding:"required,fqdn"`
-}
-
-type DNSInstruction struct {
-	Type     string `json:"type"`
-	Host     string `json:"host"`
-	Value    string `json:"value"`
-	Priority int    `json:"priority,omitempty"`
-}
-
-type AddDomainResp struct {
-	Domain       Domain           `json:"domain"`
-	DNSRecords   []DNSInstruction `json:"dns_records"`
-	Instructions string           `json:"instructions"`
-}
-
 type CreateMailboxReq struct {
 	Address   string `json:"address,omitempty"` // 可选，为空则随机生成
 	Domain    string `json:"domain,omitempty"`
 	DomainID  int    `json:"domain_id,omitempty"`
 	Mode      string `json:"mode,omitempty"`      // single | multi，未传时随机
 	Subdomain string `json:"subdomain,omitempty"` // multi 模式下自定义多级子域名前缀
-}
-
-type CreateMailboxResp struct {
-	Mailbox Mailbox `json:"mailbox"`
-}
-
-type ListResp[T any] struct {
-	Data  []T `json:"data"`
-	Total int `json:"total"`
-	Page  int `json:"page"`
-	Size  int `json:"size"`
 }
 
 type EmailSummary struct {

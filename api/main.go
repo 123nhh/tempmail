@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -62,8 +63,13 @@ func main() {
 	defer rdb.Close()
 
 	// 新邮件实时推送（SSE），多实例部署时通过 Redis Pub/Sub 共享事件
+	var bgWG sync.WaitGroup
 	hub := realtime.NewHub(rdb)
-	go hub.Run(ctx)
+	bgWG.Add(1)
+	go func() {
+		defer bgWG.Done()
+		hub.Run(ctx)
+	}()
 	publishDelivered := func(c *gin.Context, d store.DeliveredEmail, sender, subject string, size int) {
 		if !d.Delivered {
 			return
@@ -78,13 +84,17 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
+	r.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{"/health"}}))
+	if err := r.SetTrustedProxies([]string{"127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}); err != nil {
+		log.Printf("[WARN] failed to set trusted proxies: %v", err)
+	}
 
 	// CORS：允许前端跨域访问
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:  []string{"*"},
 		AllowMethods:  []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:  []string{"Origin", "Content-Type", "Authorization", "X-API-Key"},
-		ExposeHeaders: []string{"X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"},
+		ExposeHeaders: []string{"X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset", "Retry-After"},
 		MaxAge:        12 * time.Hour,
 	}))
 
@@ -109,8 +119,8 @@ func main() {
 	public := r.Group("/public")
 	{
 		public.GET("/settings", settingH.GetPublic)
-		public.POST("/key-login", accountH.KeyLogin)
-		public.POST("/register", registerH.Register)
+		public.POST("/key-login", middleware.RateLimitByIP(rdb, "key-login", 30, 60), accountH.KeyLogin)
+		public.POST("/register", middleware.RateLimitByIP(rdb, "register", 20, 60), registerH.Register)
 		public.GET("/stats", statsH.Get)
 		public.GET("/auth/linuxdo", linuxDOH.Start)
 		public.GET("/auth/linuxdo/callback", linuxDOH.Callback)
@@ -118,8 +128,13 @@ func main() {
 		public.GET("/auth/github/callback", gitHubH.Callback)
 	}
 
-	// API 路由组（需要认证 + 速率限制）
+	// API 路由组（认证前 IP 防刷 + API Key 认证 + 账户级速率限制）
+	preAuthLimit := cfg.RateLimit * 2
+	if preAuthLimit < 1000 {
+		preAuthLimit = 1000
+	}
 	api := r.Group("/api")
+	api.Use(middleware.RateLimitByIP(rdb, "api-preauth", preAuthLimit, cfg.RateWindow))
 	api.Use(middleware.Auth(db))
 	api.Use(middleware.RateLimit(rdb, cfg.RateLimit, cfg.RateWindow))
 	{
@@ -136,6 +151,7 @@ func main() {
 		// 邮箱管理
 		api.POST("/mailboxes", mailboxH.Create)
 		api.GET("/mailboxes", mailboxH.List)
+		api.GET("/mailboxes/:id", mailboxH.Get)
 		api.DELETE("/mailboxes/:id", mailboxH.Delete)
 		api.POST("/mailboxes/:id/extend", liveH.Extend)
 		api.GET("/mailboxes/:id/events", liveH.Events)
@@ -267,15 +283,24 @@ func main() {
 	}
 
 	// ==================== 邮箱自动过期清理 ====================
+	bgWG.Add(1)
 	go func() {
+		defer bgWG.Done()
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		log.Println("[OK] Mailbox expiry cleaner started (TTL=30min, interval=1min)")
-		for range ticker.C {
-			if deleted, err := db.DeleteExpiredMailboxes(context.Background()); err != nil {
-				log.Printf("[cleaner] error: %v", err)
-			} else if deleted > 0 {
-				log.Printf("[cleaner] deleted %d expired mailboxes", deleted)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if deleted, err := db.DeleteExpiredMailboxes(ctx); err != nil {
+					if ctx.Err() == nil {
+						log.Printf("[cleaner] error: %v", err)
+					}
+				} else if deleted > 0 {
+					log.Printf("[cleaner] deleted %d expired mailboxes", deleted)
+				}
 			}
 		}
 	}()
@@ -291,58 +316,87 @@ func main() {
 	// ==================== MX 自动验证轮询 ====================
 	// 与域名接口一致：优先读后台设置 smtp_server_ip，未设置时回退到 SMTP_SERVER_IP 环境变量
 	serverIPForMX := func() string {
-		if ip, err := db.GetSetting(context.Background(), "smtp_server_ip"); err == nil && ip != "" {
+		if ip, err := db.GetSetting(ctx, "smtp_server_ip"); err == nil && ip != "" {
 			return ip
 		}
 		return cfg.SMTPServerIP
 	}
+	bgWG.Add(1)
 	go func() {
+		defer bgWG.Done()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		log.Println("[OK] MX domain verifier started (pending check=30s, active re-check=6h)")
 		reCheckTicker := time.NewTicker(6 * time.Hour)
 		defer reCheckTicker.Stop()
 		refreshActiveDomains := func() {
-			activeDomains, err := db.GetActiveDomains(context.Background())
-			if err != nil {
-				log.Printf("[mx-recheck] list active error: %v", err)
+			serverIP := serverIPForMX()
+			if serverIP == "" {
+				log.Println("[mx-recheck] smtp_server_ip is empty, skipping active domain re-check")
 				return
 			}
-			serverIP := serverIPForMX()
+			activeDomains, err := db.GetActiveDomains(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Printf("[mx-recheck] list active error: %v", err)
+				}
+				return
+			}
 			log.Printf("[mx-recheck] checking %d active domains", len(activeDomains))
 			for _, d := range activeDomains {
-				matched, details, mxStatus := store.CheckDomainMXDetails(d.Domain, serverIP)
+				if ctx.Err() != nil {
+					return
+				}
+				matched, details, mxStatus := store.CheckDomainMXDetails(ctx, d.Domain, serverIP)
 				supportsSingle, supportsWildcard := store.DomainCapabilitiesFromMX(details)
-				if err := db.UpdateDomainCapabilities(context.Background(), d.ID, supportsSingle, supportsWildcard); err != nil {
-					log.Printf("[mx-recheck] update %s capabilities error: %v", d.Domain, err)
+				if err := db.UpdateDomainCapabilities(ctx, d.ID, supportsSingle, supportsWildcard); err != nil {
+					if ctx.Err() == nil {
+						log.Printf("[mx-recheck] update %s capabilities error: %v", d.Domain, err)
+					}
 					continue
 				}
 				if !matched {
-					log.Printf("[mx-recheck] [WARN] %s MX no longer valid (%s), domain disabled", d.Domain, mxStatus)
+					log.Printf("[mx-recheck] [WARN] %s MX no longer valid (%s), domain moved to pending", d.Domain, mxStatus)
 				} else {
 					log.Printf("[mx-recheck] %s capabilities refreshed, single=%v wildcard=%v", d.Domain, supportsSingle, supportsWildcard)
 				}
 			}
 		}
-		go refreshActiveDomains()
+		bgWG.Add(1)
+		go func() {
+			defer bgWG.Done()
+			refreshActiveDomains()
+		}()
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case <-ticker.C:
 				// 处理待验证域名
-				pendingDomains, err := db.ListPendingDomains(context.Background())
+				serverIP := serverIPForMX()
+				if serverIP == "" {
+					continue
+				}
+				pendingDomains, err := db.ListPendingDomains(ctx)
 				if err != nil {
-					log.Printf("[mx-verifier] list pending error: %v", err)
+					if ctx.Err() == nil {
+						log.Printf("[mx-verifier] list pending error: %v", err)
+					}
 					continue
 				}
 				if len(pendingDomains) == 0 {
 					continue
 				}
-				serverIP := serverIPForMX()
 				for _, d := range pendingDomains {
-					matched, details, mxStatus := store.CheckDomainMXDetails(d.Domain, serverIP)
+					if ctx.Err() != nil {
+						return
+					}
+					matched, details, mxStatus := store.CheckDomainMXDetails(ctx, d.Domain, serverIP)
 					supportsSingle, supportsWildcard := store.DomainCapabilitiesFromMX(details)
-					if err := db.UpdateDomainCapabilities(context.Background(), d.ID, supportsSingle, supportsWildcard); err != nil {
-						log.Printf("[mx-verifier] update %s capabilities error: %v", d.Domain, err)
+					if err := db.UpdateDomainCapabilities(ctx, d.ID, supportsSingle, supportsWildcard); err != nil {
+						if ctx.Err() == nil {
+							log.Printf("[mx-verifier] update %s capabilities error: %v", d.Domain, err)
+						}
 						continue
 					}
 					if matched {
@@ -353,19 +407,27 @@ func main() {
 				}
 
 			case <-reCheckTicker.C:
-				// 每 6 小时重新检测所有已激活域名，MX 失效则自动停用
+				// 每 6 小时重新检测所有已激活域名，MX 失效则自动移出活跃池
 				refreshActiveDomains()
 			}
 		}
 	}()
 
 	// ==================== 写出管理员 API Key 文件 ====================
+	bgWG.Add(1)
 	go func() {
+		defer bgWG.Done()
 		// 等待 DB 就绪后再读取（延迟 1 秒）
-		time.Sleep(1 * time.Second)
-		adminKey, err := db.GetAdminAPIKey(context.Background())
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(1 * time.Second):
+		}
+		adminKey, err := db.GetAdminAPIKey(ctx)
 		if err != nil {
-			log.Printf("[adminkey] could not fetch admin key: %v", err)
+			if ctx.Err() == nil {
+				log.Printf("[adminkey] could not fetch admin key: %v", err)
+			}
 			return
 		}
 		keyFile := os.Getenv("ADMIN_KEY_FILE")
@@ -419,6 +481,16 @@ func main() {
 		cancelDrain()
 	}
 	stopBackground()
+	bgDone := make(chan struct{})
+	go func() {
+		bgWG.Wait()
+		close(bgDone)
+	}()
+	select {
+	case <-bgDone:
+	case <-time.After(6 * time.Second):
+		log.Printf("[shutdown] background workers timed out")
+	}
 	select {
 	case <-statsFlusherDone:
 	case <-time.After(6 * time.Second):

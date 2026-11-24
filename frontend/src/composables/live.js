@@ -82,5 +82,5 @@ export function useMailboxLive(idRef, { onEmail, onMailbox, onExpired, onMissing
     document.removeEventListener('visibilitychange', onVisible)
   })
 
-  return { status, reconnect: () => connect(idRef.value) }
+  return { status }
 }
