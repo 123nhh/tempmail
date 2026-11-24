@@ -18,6 +18,7 @@ const loading = ref(true)
 
 const createOpen = ref(false)
 const username = ref('')
+const email = ref('')
 const creating = ref(false)
 const createErr = ref('')
 const created = ref(null)
@@ -40,6 +41,7 @@ async function load(p = page.value) {
 
 function openCreate() {
   username.value = ''
+  email.value = ''
   createErr.value = ''
   created.value = null
   createOpen.value = true
@@ -51,10 +53,16 @@ async function create() {
     createErr.value = '用户名长度需为 2–64 个字符'
     return
   }
+  const mail = email.value.trim()
+  email.value = mail
+  if (mail && (mail.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(mail))) {
+    createErr.value = '联系邮箱格式不正确'
+    return
+  }
   creating.value = true
   createErr.value = ''
   try {
-    created.value = await api.admin.createAccount(u)
+    created.value = await api.admin.createAccount(u, mail)
     toast.success('账户已创建')
     load(1)
   } catch (e) {
@@ -119,6 +127,7 @@ onMounted(() => load(1))
                 <span v-if="a.is_admin" class="badge b-brand"><ShieldCheck aria-hidden="true" />管理员</span>
                 <span v-else class="badge b-muted"><User aria-hidden="true" />用户</span>
               </div>
+              <span v-if="a.email" class="mail small muted mono" :title="a.email">{{ a.email }}</span>
             </td>
             <td class="key"><KeyValue :value="a.api_key" secret copy-label="复制 API Key" /></td>
             <td class="num">{{ num(a.active_mailbox_count || 0) }} / {{ num(a.mailbox_count || 0) }}</td>
@@ -154,15 +163,34 @@ onMounted(() => load(1))
 
   <BaseModal :open="createOpen" title="创建账户" :icon="Plus" @close="createOpen = false">
     <template v-if="!created">
-      <form id="acc-form" class="field" @submit.prevent="create">
-        <label for="acc-name">用户名</label>
-        <input id="acc-name" v-model="username" class="inp" placeholder="username" maxlength="64" autocomplete="off" />
-        <span class="hint">2–64 个字符。创建后会生成该账户的 API Key。</span>
+      <form id="acc-form" class="stack" @submit.prevent="create">
+        <div class="field">
+          <label for="acc-name">用户名</label>
+          <input id="acc-name" v-model="username" class="inp" placeholder="username" maxlength="64" autocomplete="off" />
+          <span class="hint">2–64 个字符。创建后会生成该账户的 API Key。</span>
+        </div>
+        <div class="field">
+          <label for="acc-email">联系邮箱 <span class="muted">（可选）</span></label>
+          <input
+            id="acc-email"
+            v-model="email"
+            class="inp"
+            type="email"
+            placeholder="contact@example.com"
+            maxlength="254"
+            autocomplete="off"
+            @blur="email = email.trim()"
+          />
+        </div>
       </form>
       <p v-if="createErr" class="err-t" role="alert">{{ createErr }}</p>
     </template>
     <template v-else>
-      <p>账户 <strong>{{ created.username }}</strong> 已创建，请把下面的 API Key 发给对方：</p>
+      <p>
+        账户 <strong>{{ created.username }}</strong>
+        <template v-if="created.email">（<span class="mono">{{ created.email }}</span>）</template>
+        已创建，请把下面的 API Key 发给对方：
+      </p>
       <KeyValue :value="created.api_key" copy-label="复制 API Key" />
     </template>
     <template #footer>
@@ -177,6 +205,7 @@ onMounted(() => load(1))
 
 <style scoped>
 .user { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mail { display: block; margin-top: 2px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .key { min-width: 220px; max-width: 320px; }
 .key :deep(.kv) { padding: 3px 4px 3px 10px; font-size: 12px; }
 .pager { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--border); }

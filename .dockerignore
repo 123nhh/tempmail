@@ -1,0 +1,24 @@
+# Version control & CI
+.git
+.github
+
+# Local secrets & runtime data
+.env
+data/
+
+# Documentation & design assets
+docs/
+design/
+*.md
+
+# Frontend build artifacts & legacy code
+frontend/node_modules
+frontend/dist
+frontend-legacy/
+
+# Local Go binaries
+api/tempmail
+api/*.exe
+
+# OS metadata
+.DS_Store

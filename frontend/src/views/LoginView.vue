@@ -62,6 +62,7 @@ async function doLogin(k = key.value) {
       session.persist(v, {
         id: registered.value.id,
         username: registered.value.username,
+        ...(registered.value.email ? { email: registered.value.email } : {}),
         is_admin: false,
       })
       const ok = await session.restore()
@@ -85,12 +86,20 @@ async function doRegister() {
     error.value = '用户名长度需为 2–64 个字符'
     return
   }
+  const mail = email.value.trim()
+  email.value = mail
+  if (mail && (mail.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(mail))) {
+    error.value = '联系邮箱格式不正确'
+    return
+  }
   busy.value = true
   error.value = ''
   try {
     const body = { username: u }
-    if (email.value.trim()) body.email = email.value.trim()
-    registered.value = await api.register(body)
+    if (mail) body.email = mail
+    const r = await api.register(body)
+    // 后端旧版本可能不回传 email，用提交值兜底，便于自动登录后在「我的 API Key」展示
+    registered.value = mail && !r?.email ? { ...r, email: mail } : r
   } catch (e) {
     error.value = e.status === 409 ? '用户名已被占用' : e.message
   } finally {
@@ -228,7 +237,18 @@ function oauthGo(p) {
             </div>
             <div class="field">
               <label for="reg-email">联系邮箱 <span class="muted">（可选）</span></label>
-              <input id="reg-email" v-model="email" class="inp" type="email" placeholder="contact@example.com" autocomplete="email" />
+              <input
+                id="reg-email"
+                v-model="email"
+                class="inp"
+                type="email"
+                placeholder="contact@example.com"
+                autocomplete="email"
+                maxlength="254"
+                aria-describedby="reg-email-hint"
+                @blur="email = email.trim()"
+              />
+              <span id="reg-email-hint" class="hint">仅用于管理员联系你，不会公开</span>
             </div>
             <p v-if="error" class="err-t" role="alert">{{ error }}</p>
             <button type="submit" class="btn btn-primary btn-lg btn-block" :disabled="busy">

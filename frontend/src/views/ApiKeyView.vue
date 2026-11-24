@@ -22,6 +22,7 @@ const example = computed(() => `curl -H "Authorization: Bearer YOUR_API_KEY" ${b
       <dl class="dl">
         <dt>账户</dt><dd>{{ session.username }}</dd>
         <dt>角色</dt><dd>{{ session.isAdmin ? '管理员' : '普通用户' }}</dd>
+        <dt v-if="session.account?.email">联系邮箱</dt><dd v-if="session.account?.email" class="mono">{{ session.account.email }}</dd>
         <dt v-if="session.account?.created_at">创建时间</dt><dd v-if="session.account?.created_at">{{ formatFull(session.account.created_at) }}</dd>
       </dl>
       <div class="notice warn">

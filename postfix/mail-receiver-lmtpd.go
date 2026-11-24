@@ -11,6 +11,7 @@
 // 启动参数（环境变量）：
 //
 //	API_URL          API 地址，默认 http://api:8080
+//	INTERNAL_API_KEY 可选内部接口鉴权密钥，非空时附带 X-Internal-Key 请求头
 //	LMTPD_SOCKET     unix socket 路径，默认 /var/run/postfix/mail-receiver.sock
 //	LMTPD_BIND       可选 TCP 监听 host:port，调试用
 //	LMTPD_HOSTNAME   LMTP banner 中的主机名
@@ -41,6 +42,11 @@ import (
 	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/encoding/traditionalchinese"
+	"golang.org/x/text/transform"
 )
 
 const (
@@ -87,11 +93,19 @@ type batchResponse struct {
 }
 
 type server struct {
-	hostname   string
-	apiURL     string
-	httpClient *http.Client
-	conns      atomic.Int64
-	sessionsWG sync.WaitGroup
+	hostname    string
+	apiURL      string
+	internalKey string
+	httpClient  *http.Client
+	conns       atomic.Int64
+	sessionsWG  sync.WaitGroup
+}
+
+func (s *server) apiInternalKey() string {
+	if s.internalKey != "" {
+		return s.internalKey
+	}
+	return os.Getenv("INTERNAL_API_KEY")
 }
 
 func main() {
@@ -101,9 +115,10 @@ func main() {
 	hostname := getenv("LMTPD_HOSTNAME", "mail-receiver.local")
 
 	srv := &server{
-		hostname:   hostname,
-		apiURL:     apiURL,
-		httpClient: newAPIHTTPClient(),
+		hostname:    hostname,
+		apiURL:      apiURL,
+		internalKey: os.Getenv("INTERNAL_API_KEY"),
+		httpClient:  newAPIHTTPClient(),
 	}
 
 	listeners := make([]net.Listener, 0, 2)
@@ -502,6 +517,9 @@ func (s *server) deliver(ctx context.Context, payload deliverPayload) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if key := s.apiInternalKey(); key != "" {
+		req.Header.Set("X-Internal-Key", key)
+	}
 
 	res, err := s.httpClient.Do(req)
 	if err != nil {
@@ -526,6 +544,9 @@ func (s *server) deliverBatch(ctx context.Context, payload deliverBatchPayload) 
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if key := s.apiInternalKey(); key != "" {
+		req.Header.Set("X-Internal-Key", key)
+	}
 
 	res, err := s.httpClient.Do(req)
 	if err != nil {
@@ -621,7 +642,23 @@ func decodeHeader(raw string) string {
 	return decoded
 }
 
+func chineseDecoder(charset string) *encoding.Decoder {
+	switch strings.ToLower(strings.TrimSpace(charset)) {
+	case "gb18030", "gb-18030", "gbk", "gb2312", "gb_2312", "gb_2312-80", "csgb2312", "cp936", "x-gbk":
+		return simplifiedchinese.GB18030.NewDecoder()
+	case "hz-gb-2312":
+		return simplifiedchinese.HZGB2312.NewDecoder()
+	case "big5", "big-5", "csbig5", "cp950":
+		return traditionalchinese.Big5.NewDecoder()
+	default:
+		return nil
+	}
+}
+
 func charsetReader(charset string, input io.Reader) (io.Reader, error) {
+	if dec := chineseDecoder(charset); dec != nil {
+		return io.LimitReader(transform.NewReader(io.LimitReader(input, maxMessageBytes), dec), maxMessageBytes), nil
+	}
 	switch strings.ToLower(strings.TrimSpace(charset)) {
 	case "", "utf-8", "utf8", "us-ascii", "ascii":
 		return input, nil
@@ -704,6 +741,12 @@ func stripASCIIWhitespace(in []byte) []byte {
 }
 
 func convertCharset(data []byte, charset string) string {
+	if dec := chineseDecoder(charset); dec != nil {
+		if out, err := dec.Bytes(data); err == nil {
+			return string(out)
+		}
+		return string(data)
+	}
 	switch strings.ToLower(strings.TrimSpace(charset)) {
 	case "iso-8859-1", "latin1", "latin-1", "iso_8859-1":
 		return decodeLatin1(data)

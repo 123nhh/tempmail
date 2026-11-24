@@ -103,6 +103,7 @@ var (
 	ErrPendingDomainsLimit = errors.New("pending domain limit reached")
 	ErrDomainNoCapability  = errors.New("domain has no verified MX capability")
 	ErrMailboxLimitReached = errors.New("mailbox quota limit reached")
+	ErrAccountDisabled     = errors.New("account is disabled")
 )
 
 const dnsLookupTimeout = 4 * time.Second
@@ -162,28 +163,48 @@ func (s *Store) Close() {
 
 // ==================== Account ====================
 
+// accountColumns 与 scanAccount 的字段顺序保持一致（亦与 model.Account 字段顺序一致）。
+const accountColumns = `id, username, api_key, COALESCE(linuxdo_id, ''), COALESCE(email, ''), is_admin, is_active, created_at, updated_at`
+
+func scanAccount(row pgx.Row, a *model.Account) error {
+	return row.Scan(&a.ID, &a.Username, &a.APIKey, &a.LinuxDOID, &a.Email, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
+}
+
+// EnsureSchema 幂等地补齐新版本新增的列，便于老库平滑升级。
+func (s *Store) EnsureSchema(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx,
+		`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS email VARCHAR(255) NOT NULL DEFAULT ''`)
+	return err
+}
+
 func (s *Store) GetAccountByAPIKey(ctx context.Context, apiKey string) (*model.Account, error) {
 	var a model.Account
-	err := s.pool.QueryRow(ctx,
-		`SELECT id, username, api_key, COALESCE(linuxdo_id, ''), is_admin, is_active, created_at, updated_at
+	err := scanAccount(s.pool.QueryRow(ctx,
+		`SELECT `+accountColumns+`
 		 FROM accounts WHERE api_key = $1 AND is_active = TRUE`, apiKey,
-	).Scan(&a.ID, &a.Username, &a.APIKey, &a.LinuxDOID, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
+	), &a)
 	if err != nil {
 		return nil, err
 	}
 	return &a, nil
 }
 
-func (s *Store) GetOrCreateLinuxDOAccount(ctx context.Context, linuxDOID, username string) (*model.Account, error) {
+// getOrCreateOAuthAccount 按第三方 ID 查找账号；不存在则创建。
+// idColumn 仅允许内部常量（linuxdo_id / github_id），不接受外部输入。
+// 已存在但被停用的账号返回 ErrAccountDisabled，而不是尝试重复插入。
+func (s *Store) getOrCreateOAuthAccount(ctx context.Context, idColumn, externalID, username, provider string) (*model.Account, error) {
 	var a model.Account
-	err := s.pool.QueryRow(ctx,
-		`SELECT id, username, api_key, COALESCE(linuxdo_id, ''), is_admin, is_active, created_at, updated_at
-		 FROM accounts WHERE linuxdo_id = $1 AND is_active = TRUE`, linuxDOID,
-	).Scan(&a.ID, &a.Username, &a.APIKey, &a.LinuxDOID, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
+	err := scanAccount(s.pool.QueryRow(ctx,
+		`SELECT `+accountColumns+`
+		 FROM accounts WHERE `+idColumn+` = $1`, externalID,
+	), &a)
 	if err == nil {
+		if !a.IsActive {
+			return nil, ErrAccountDisabled
+		}
 		return &a, nil
 	}
-	if err != pgx.ErrNoRows {
+	if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, err
 	}
 
@@ -193,57 +214,39 @@ func (s *Store) GetOrCreateLinuxDOAccount(ctx context.Context, linuxDOID, userna
 		if i > 0 {
 			name = fmt.Sprintf("%s_%d", username, i+1)
 		}
-		err = s.pool.QueryRow(ctx,
-			`INSERT INTO accounts (username, api_key, linuxdo_id) VALUES ($1, $2, $3)
-			 RETURNING id, username, api_key, COALESCE(linuxdo_id, ''), is_admin, is_active, created_at, updated_at`,
-			name, apiKey, linuxDOID,
-		).Scan(&a.ID, &a.Username, &a.APIKey, &a.LinuxDOID, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
+		err = scanAccount(s.pool.QueryRow(ctx,
+			`INSERT INTO accounts (username, api_key, `+idColumn+`) VALUES ($1, $2, $3)
+			 RETURNING `+accountColumns,
+			name, apiKey, externalID,
+		), &a)
 		if err == nil {
 			return &a, nil
 		}
 	}
-	return nil, errors.New("failed to create Linux DO account")
+	return nil, fmt.Errorf("failed to create %s account", provider)
+}
+
+func (s *Store) GetOrCreateLinuxDOAccount(ctx context.Context, linuxDOID, username string) (*model.Account, error) {
+	return s.getOrCreateOAuthAccount(ctx, "linuxdo_id", linuxDOID, username, "Linux DO")
 }
 
 func (s *Store) GetOrCreateGitHubAccount(ctx context.Context, gitHubID, username string) (*model.Account, error) {
-	var a model.Account
-	err := s.pool.QueryRow(ctx,
-		`SELECT id, username, api_key, COALESCE(linuxdo_id, ''), is_admin, is_active, created_at, updated_at
-		 FROM accounts WHERE github_id = $1 AND is_active = TRUE`, gitHubID,
-	).Scan(&a.ID, &a.Username, &a.APIKey, &a.LinuxDOID, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
-	if err == nil {
-		return &a, nil
-	}
-	if err != pgx.ErrNoRows {
-		return nil, err
-	}
-
-	apiKey := generateAPIKey()
-	for i := 0; i < 5; i++ {
-		name := username
-		if i > 0 {
-			name = fmt.Sprintf("%s_%d", username, i+1)
-		}
-		err = s.pool.QueryRow(ctx,
-			`INSERT INTO accounts (username, api_key, github_id) VALUES ($1, $2, $3)
-			 RETURNING id, username, api_key, COALESCE(linuxdo_id, ''), is_admin, is_active, created_at, updated_at`,
-			name, apiKey, gitHubID,
-		).Scan(&a.ID, &a.Username, &a.APIKey, &a.LinuxDOID, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
-		if err == nil {
-			return &a, nil
-		}
-	}
-	return nil, errors.New("failed to create GitHub account")
+	return s.getOrCreateOAuthAccount(ctx, "github_id", gitHubID, username, "GitHub")
 }
 
 func (s *Store) CreateAccount(ctx context.Context, username string) (*model.Account, error) {
+	return s.CreateAccountWithEmail(ctx, username, "")
+}
+
+// CreateAccountWithEmail 创建账号并记录可选联系邮箱（调用方负责校验/规范化 email）。
+func (s *Store) CreateAccountWithEmail(ctx context.Context, username, email string) (*model.Account, error) {
 	apiKey := generateAPIKey()
 	var a model.Account
-	err := s.pool.QueryRow(ctx,
-		`INSERT INTO accounts (username, api_key) VALUES ($1, $2)
-		 RETURNING id, username, api_key, COALESCE(linuxdo_id, ''), is_admin, is_active, created_at, updated_at`,
-		username, apiKey,
-	).Scan(&a.ID, &a.Username, &a.APIKey, &a.LinuxDOID, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
+	err := scanAccount(s.pool.QueryRow(ctx,
+		`INSERT INTO accounts (username, api_key, email) VALUES ($1, $2, $3)
+		 RETURNING `+accountColumns,
+		username, apiKey, email,
+	), &a)
 	if err != nil {
 		return nil, err
 	}
@@ -270,6 +273,8 @@ func (s *Store) DeleteAccount(ctx context.Context, accountID uuid.UUID) error {
 	return tx.Commit(ctx)
 }
 
+// ListAccounts 先取当前页账号，再仅对这一页账号做邮箱/邮件聚合，
+// 避免对每个账号执行多次相关子查询。列顺序必须与 model.AccountWithStats 一致。
 func (s *Store) ListAccounts(ctx context.Context, page, size int) ([]model.AccountWithStats, int, error) {
 	var total int
 	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&total)
@@ -278,17 +283,38 @@ func (s *Store) ListAccounts(ctx context.Context, page, size int) ([]model.Accou
 	}
 
 	rows, err := s.pool.Query(ctx,
-		`SELECT
-			a.id, a.username, a.api_key, COALESCE(a.linuxdo_id, ''), a.is_admin, a.is_active, a.created_at, a.updated_at,
-			(SELECT COUNT(*)::BIGINT FROM mailboxes m WHERE m.account_id = a.id) AS mailbox_count,
-			(SELECT COUNT(*)::BIGINT FROM mailboxes m WHERE m.account_id = a.id AND m.expires_at > NOW()) AS active_mailbox_count,
-			(SELECT COUNT(*)::BIGINT
-			 FROM emails e
-			 JOIN mailboxes m ON m.id = e.mailbox_id
-			 WHERE m.account_id = a.id) AS current_email_count,
-			COALESCE((SELECT SUM(m.received_email_count)::BIGINT FROM mailboxes m WHERE m.account_id = a.id), 0) AS received_email_count
-		 FROM accounts a
-		 ORDER BY a.created_at DESC LIMIT $1 OFFSET $2`,
+		`WITH paged AS (
+			SELECT id, username, api_key, linuxdo_id, email, is_admin, is_active, created_at, updated_at
+			FROM accounts
+			ORDER BY created_at DESC
+			LIMIT $1 OFFSET $2
+		),
+		mb_stats AS (
+			SELECT m.account_id,
+				COUNT(*)::BIGINT AS mailbox_count,
+				COUNT(*) FILTER (WHERE m.expires_at > NOW())::BIGINT AS active_mailbox_count,
+				COALESCE(SUM(m.received_email_count), 0)::BIGINT AS received_email_count
+			FROM mailboxes m
+			WHERE m.account_id IN (SELECT id FROM paged)
+			GROUP BY m.account_id
+		),
+		email_stats AS (
+			SELECT m.account_id, COUNT(*)::BIGINT AS current_email_count
+			FROM emails e
+			JOIN mailboxes m ON m.id = e.mailbox_id
+			WHERE m.account_id IN (SELECT id FROM paged)
+			GROUP BY m.account_id
+		)
+		SELECT
+			p.id, p.username, p.api_key, COALESCE(p.linuxdo_id, ''), COALESCE(p.email, ''), p.is_admin, p.is_active, p.created_at, p.updated_at,
+			COALESCE(ms.mailbox_count, 0)::BIGINT AS mailbox_count,
+			COALESCE(ms.active_mailbox_count, 0)::BIGINT AS active_mailbox_count,
+			COALESCE(es.current_email_count, 0)::BIGINT AS current_email_count,
+			COALESCE(ms.received_email_count, 0)::BIGINT AS received_email_count
+		FROM paged p
+		LEFT JOIN mb_stats ms ON ms.account_id = p.id
+		LEFT JOIN email_stats es ON es.account_id = p.id
+		ORDER BY p.created_at DESC`,
 		size, (page-1)*size,
 	)
 	if err != nil {
@@ -755,18 +781,41 @@ func (s *Store) CreateMailboxWithLimit(ctx context.Context, accountID uuid.UUID,
 }
 
 func (s *Store) ListMailboxes(ctx context.Context, accountID uuid.UUID, page, size int) ([]model.Mailbox, int, error) {
+	return s.ListMailboxesFiltered(ctx, accountID, page, size, "", "")
+}
+
+// escapeLikePattern 转义 LIKE/ILIKE 通配符（配合 ESCAPE '\' 使用）。
+func escapeLikePattern(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
+}
+
+// ListMailboxesFiltered 列出账号下活跃邮箱，支持按地址模糊搜索（query）与排序（sortBy）。
+// sortBy: "expiry" 按到期时间升序；其他（"" / "new" / "created"）按创建时间倒序。
+func (s *Store) ListMailboxesFiltered(ctx context.Context, accountID uuid.UUID, page, size int, query, sortBy string) ([]model.Mailbox, int, error) {
+	where := `account_id = $1 AND expires_at > NOW()`
+	args := []any{accountID}
+	if query != "" {
+		args = append(args, "%"+escapeLikePattern(query)+"%")
+		where += ` AND full_address ILIKE $2 ESCAPE '\'`
+	}
+	orderBy := `created_at DESC`
+	if sortBy == "expiry" {
+		orderBy = `expires_at ASC, created_at DESC`
+	}
+
 	var total int
-	err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM mailboxes WHERE account_id = $1 AND expires_at > NOW()`, accountID).Scan(&total)
+	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM mailboxes WHERE `+where, args...).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
 
+	limitIdx := len(args) + 1
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, account_id, address, domain_id, full_address, created_at, expires_at
-		 FROM mailboxes WHERE account_id = $1 AND expires_at > NOW()
-		 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
-		accountID, size, (page-1)*size,
+		fmt.Sprintf(`SELECT id, account_id, address, domain_id, full_address, created_at, expires_at
+		 FROM mailboxes WHERE %s
+		 ORDER BY %s LIMIT $%d OFFSET $%d`, where, orderBy, limitIdx, limitIdx+1),
+		append(args, size, (page-1)*size)...,
 	)
 	if err != nil {
 		return nil, 0, err
@@ -1147,6 +1196,24 @@ func (s *Store) flushCounters(ctx context.Context) {
 		// Avoid noisy shutdown logs while still surfacing live flush failures.
 		log.Printf("[stats] flush failed: %v", err)
 	}
+}
+
+// ListRecentEmailsByAccount 返回账号下所有活跃邮箱中最近收到的邮件摘要。
+func (s *Store) ListRecentEmailsByAccount(ctx context.Context, accountID uuid.UUID, limit int) ([]model.RecentEmail, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT e.id, e.mailbox_id, m.full_address, e.sender, e.subject, e.size_bytes, e.received_at
+		 FROM emails e
+		 JOIN mailboxes m ON m.id = e.mailbox_id
+		 WHERE m.account_id = $1 AND m.expires_at > NOW()
+		 ORDER BY e.received_at DESC
+		 LIMIT $2`,
+		accountID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[model.RecentEmail])
 }
 
 func (s *Store) ListEmails(ctx context.Context, mailboxID uuid.UUID, page, size int) ([]model.EmailSummary, int, error) {

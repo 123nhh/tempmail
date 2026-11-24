@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -38,6 +40,10 @@ func main() {
 	}
 	defer db.Close()
 	log.Println("[OK] Database connected")
+	// 幂等补齐新版本新增的列（老库升级用，init.sql 仅在首次初始化时执行）
+	if err := db.EnsureSchema(ctx); err != nil {
+		log.Printf("[WARN] ensure schema failed: %v", err)
+	}
 	var deliveryBatcher *store.DeliveryBatcher
 	if cfg.DeliveryBatchEnabled {
 		deliveryBatcher = store.NewDeliveryBatcher(ctx, db, cfg.DeliveryBatchMax, cfg.DeliveryBatchWait)
@@ -157,6 +163,7 @@ func main() {
 		api.GET("/mailboxes/:id/events", liveH.Events)
 
 		// 邮件管理
+		api.GET("/emails/recent", emailH.Recent)
 		api.GET("/mailboxes/:id/emails", emailH.List)
 		api.GET("/mailboxes/:id/emails/:email_id", emailH.Get)
 		api.DELETE("/mailboxes/:id/emails/:email_id", emailH.Delete)
@@ -183,7 +190,11 @@ func main() {
 	}
 
 	// 内部邮件投递接口（Postfix pipe 调用，仅内部网络）
+	if cfg.InternalAPIKey == "" {
+		log.Printf("[WARN] INTERNAL_API_KEY is not set; /internal/* is restricted to loopback/private peer IPs only")
+	}
 	internal := r.Group("/internal")
+	internal.Use(internalAuthMiddleware(cfg.InternalAPIKey))
 	{
 		// 域名列表（供 Postfix 同步）
 		internal.GET("/domains", func(c *gin.Context) {
@@ -195,7 +206,7 @@ func main() {
 			c.JSON(http.StatusOK, gin.H{"domains": domains})
 		})
 
-		internal.POST("/deliver", func(c *gin.Context) {
+		internal.POST("/deliver", maxBodySizeMiddleware(internalDeliverMaxBodyBytes), func(c *gin.Context) {
 			var req struct {
 				Recipient string `json:"recipient" binding:"required"`
 				Sender    string `json:"sender"`
@@ -246,7 +257,7 @@ func main() {
 		// 批量投递：一次 HTTP 调用写入多个收件人。
 		// 用于 LMTP 守护进程把同一会话的多个 RCPT 合并提交。
 		// 任意一条失败会返回 5xx，调用方应当重试整批，避免丢邮件。
-		internal.POST("/deliver-batch", func(c *gin.Context) {
+		internal.POST("/deliver-batch", maxBodySizeMiddleware(internalDeliverMaxBodyBytes), func(c *gin.Context) {
 			var req struct {
 				Recipients []string `json:"recipients" binding:"required,min=1"`
 				Sender     string   `json:"sender"`
@@ -442,7 +453,6 @@ func main() {
 				log.Printf("[OK] Admin API Key written to %s", keyFile)
 			}
 		}
-		log.Printf("[ADMIN API KEY] %s", adminKey)
 	}()
 
 	// ==================== 启动服务 ====================
@@ -497,4 +507,50 @@ func main() {
 		log.Printf("[stats] final flush timed out")
 	}
 	log.Println("Server exited")
+}
+
+// internalDeliverMaxBodyBytes 限制 /internal/deliver* 请求体大小，避免超大载荷耗尽内存。
+const internalDeliverMaxBodyBytes int64 = 12 << 20
+
+// internalAuthMiddleware 保护 /internal/* 接口。
+//   - internalKey 非空：要求请求头 X-Internal-Key 与之匹配（常量时间比较），否则 401。
+//   - internalKey 为空：仅允许直连对端（RemoteAddr，不信任 X-Forwarded-For）为回环或私有网段地址，否则 403。
+func internalAuthMiddleware(internalKey string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if internalKey != "" {
+			provided := c.GetHeader("X-Internal-Key")
+			if subtle.ConstantTimeCompare([]byte(provided), []byte(internalKey)) != 1 {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+				return
+			}
+			c.Next()
+			return
+		}
+
+		host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
+		if err != nil {
+			host = c.Request.RemoteAddr
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !(ip.IsLoopback() || ip.IsPrivate()) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+			return
+		}
+		c.Next()
+	}
+}
+
+// maxBodySizeMiddleware 限制请求体大小：声明的 Content-Length 超限直接 413，
+// 未声明长度（chunked）时由 http.MaxBytesReader 在读取超限时报错（绑定失败返回 400）。
+func maxBodySizeMiddleware(limit int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.ContentLength > limit {
+			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large"})
+			return
+		}
+		if c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
+		}
+		c.Next()
+	}
 }

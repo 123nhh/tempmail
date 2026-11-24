@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -114,6 +115,10 @@ func (h *LinuxDOHandler) Callback(c *gin.Context) {
 	username := linuxDOUsername(profile)
 	account, err := h.store.GetOrCreateLinuxDOAccount(c.Request.Context(), linuxDOID, username)
 	if err != nil {
+		if errors.Is(err, store.ErrAccountDisabled) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "account is disabled"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -123,6 +128,7 @@ func (h *LinuxDOHandler) Callback(c *gin.Context) {
 		"id":         account.ID,
 		"username":   account.Username,
 		"is_admin":   account.IsAdmin,
+		"email":      account.Email,
 		"created_at": account.CreatedAt,
 	})
 	c.Header("Content-Type", "text/html; charset=utf-8")

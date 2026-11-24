@@ -1,7 +1,7 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { Plus, Search, Inbox, Trash2, Mail, RefreshCw, ArrowRight, TimerReset } from '@lucide/vue'
+import { Plus, Search, Inbox, Trash2, Mail, RefreshCw, ArrowRight, TimerReset, ChevronLeft, ChevronRight } from '@lucide/vue'
 import PageHeader from '../components/ui/PageHeader.vue'
 import EmptyState from '../components/ui/EmptyState.vue'
 import SkeletonRows from '../components/ui/SkeletonRows.vue'
@@ -12,39 +12,71 @@ import { confirm, toast } from '../composables/feedback'
 import { extendMailbox, mailboxBus, mailboxesChanged, openCreateMailbox, patchMailbox } from '../composables/mailboxBus'
 import { checkExpiry, forgetExpiry } from '../composables/expiryReminder'
 import { useNow } from '../composables/poller'
-import { expiryInfo, formatDate, isExpired } from '../utils/format'
+import { formatDate, isExpired, num } from '../utils/format'
 
 const router = useRouter()
 const now = useNow(15000)
 
+// 服务端分页 + 搜索 + 排序
+const SIZE = 20
 const loading = ref(true)
 const allItems = ref([])
 const total = ref(0)
+const page = ref(1)
+const pages = computed(() => Math.max(1, Math.ceil(total.value / SIZE)))
+// 停留在页面期间到期的邮箱本地先隐藏，下次加载时由后端剔除
 const items = computed(() => allItems.value.filter(m => !isExpired(m, now.value)))
 const q = ref('')
 const sort = ref('expiry')
+const keyword = computed(() => q.value.trim())
+// 已加载结果对应的关键词，用于区分“没有邮箱”和“没有匹配结果”
+const loadedQ = ref('')
 
-const filtered = computed(() => {
-  const k = q.value.trim().toLowerCase()
-  const list = k ? items.value.filter(m => m.full_address.toLowerCase().includes(k)) : [...items.value]
-  if (sort.value === 'expiry') list.sort((a, b) => expiryInfo(a, now.value).mins - expiryInfo(b, now.value).mins)
-  else list.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-  return list
-})
-
-async function load() {
+let seq = 0
+async function load(p = page.value) {
+  const my = ++seq
   loading.value = true
   try {
-    const page = await api.listMailboxesPage(1, 100)
-    allItems.value = Array.isArray(page) ? page : (page?.data || [])
-    total.value = typeof page?.total === 'number' ? page.total : allItems.value.length
-    checkExpiry(allItems.value)
+    const kw = keyword.value
+    const r = await api.listMailboxesPage(p, SIZE, { q: kw, sort: sort.value })
+    if (my !== seq) return // 已被更新的请求取代（快速输入 / 翻页）
+    const list = Array.isArray(r) ? r : (r?.data || [])
+    const t = typeof r?.total === 'number' ? r.total : list.length
+    // 当前页已越界（例如其他页面删除了邮箱）时回退到最后一页
+    const last = Math.max(1, Math.ceil(t / SIZE))
+    if (!list.length && p > last) {
+      load(last)
+      return
+    }
+    allItems.value = list
+    total.value = t
+    page.value = p
+    loadedQ.value = kw
+    checkExpiry(list)
   } catch (e) {
-    toast.error(`加载失败：${e.message}`)
+    if (my === seq) toast.error(`加载失败：${e.message}`)
   } finally {
-    loading.value = false
+    if (my === seq) loading.value = false
   }
 }
+
+// 搜索 250ms 防抖，排序切换立即生效；两者都回到第 1 页
+let timer = 0
+watch(keyword, () => {
+  clearTimeout(timer)
+  timer = setTimeout(() => load(1), 250)
+})
+watch(sort, () => {
+  clearTimeout(timer)
+  load(1)
+})
+onBeforeUnmount(() => clearTimeout(timer))
+
+const subtitle = computed(() => {
+  if (loading.value && !allItems.value.length) return '加载中…'
+  if (loadedQ.value) return `找到 ${num(total.value)} 个匹配邮箱`
+  return `共 ${num(total.value)} 个邮箱，到期后自动删除`
+})
 
 async function remove(mb) {
   const ok = await confirm({
@@ -58,6 +90,8 @@ async function remove(mb) {
   try {
     await api.deleteMailbox(mb.id)
     forgetExpiry(mb.id)
+    // 删掉本页最后一行时回到上一页；mailboxesChanged 触发的重载会读取更新后的 page
+    if (allItems.value.length <= 1 && page.value > 1) page.value--
     allItems.value = allItems.value.filter(m => m.id !== mb.id)
     if (total.value > 0) total.value--
     toast.success('邮箱已删除')
@@ -81,17 +115,14 @@ function open(mb) {
   router.push({ name: 'mailbox', params: { id: mb.id } })
 }
 
-watch(() => mailboxBus.version, load)
-onMounted(load)
+watch(() => mailboxBus.version, () => load())
+onMounted(() => load(1))
 </script>
 
 <template>
-  <PageHeader
-    title="我的邮箱"
-    :sub="loading ? '加载中…' : total > allItems.length ? `共 ${total} 个邮箱（当前显示前 ${items.length} 个），到期后自动删除` : `共 ${items.length} 个邮箱，到期后自动删除`"
-  >
+  <PageHeader title="我的邮箱" :sub="subtitle">
     <template #actions>
-      <button type="button" class="btn btn-secondary" :disabled="loading" @click="load">
+      <button type="button" class="btn btn-secondary" :disabled="loading" @click="load()">
         <RefreshCw :class="{ spin: loading }" aria-hidden="true" />刷新
       </button>
       <button type="button" class="btn btn-primary" @click="openCreateMailbox"><Plus aria-hidden="true" />新建邮箱</button>
@@ -110,15 +141,15 @@ onMounted(load)
       </div>
     </div>
 
-    <SkeletonRows v-if="loading" :rows="4" :cols="4" />
+    <SkeletonRows v-if="loading && !allItems.length" :rows="4" :cols="4" />
+    <EmptyState v-else-if="!items.length && loadedQ" :icon="Search">没有匹配“{{ loadedQ }}”的邮箱</EmptyState>
     <EmptyState v-else-if="!items.length" :icon="Mail" title="还没有邮箱">
       创建一个临时邮箱，用它接收验证码、注册邮件等。
       <template #actions>
         <button type="button" class="btn btn-primary btn-sm" @click="openCreateMailbox"><Plus aria-hidden="true" />新建邮箱</button>
       </template>
     </EmptyState>
-    <EmptyState v-else-if="!filtered.length" :icon="Search">没有匹配“{{ q }}”的邮箱</EmptyState>
-    <div v-else class="table-wrap">
+    <div v-else class="table-wrap" :class="{ busy: loading }" :aria-busy="loading ? 'true' : 'false'">
       <table class="tbl">
         <thead>
           <tr>
@@ -129,7 +160,7 @@ onMounted(load)
           </tr>
         </thead>
         <TransitionGroup tag="tbody" name="row">
-          <tr v-for="mb in filtered" :key="mb.id" class="clickable" @click="open(mb)">
+          <tr v-for="mb in items" :key="mb.id" class="clickable" @click="open(mb)">
             <td>
               <RouterLink :to="{ name: 'mailbox', params: { id: mb.id } }" class="addr" @click.stop>{{ mb.full_address }}</RouterLink>
             </td>
@@ -167,6 +198,15 @@ onMounted(load)
         </TransitionGroup>
       </table>
     </div>
+    <div v-if="total > SIZE" class="pager">
+      <span class="small muted">第 {{ page }} / {{ pages }} 页</span>
+      <button type="button" class="btn btn-secondary btn-sm" :disabled="page <= 1 || loading" @click="load(page - 1)">
+        <ChevronLeft aria-hidden="true" />上一页
+      </button>
+      <button type="button" class="btn btn-secondary btn-sm" :disabled="page >= pages || loading" @click="load(page + 1)">
+        下一页<ChevronRight aria-hidden="true" />
+      </button>
+    </div>
   </section>
 
   <p class="small muted tip">
@@ -183,6 +223,9 @@ onMounted(load)
 .addr { font-family: var(--mono); font-size: 13px; color: var(--text); text-decoration: none; overflow-wrap: anywhere; }
 .addr:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
 .acts { display: inline-flex; gap: 2px; }
+.table-wrap.busy { opacity: .6; transition: opacity var(--ease); }
+.pager { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--border); }
+.pager .small { margin-right: auto; }
 .tip a { display: inline-flex; align-items: center; gap: 2px; }
 .tip .i { width: 13px; height: 13px; }
 @media (max-width: 640px) {

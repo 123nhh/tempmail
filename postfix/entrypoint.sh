@@ -18,6 +18,7 @@ mkdir -p "$SOCK_DIR"
 SOCK_PATH="$SOCK_DIR/mail-receiver"
 export LMTPD_SOCKET="$SOCK_PATH"
 export API_URL="${API_URL:-http://api:8080}"
+export INTERNAL_API_KEY="${INTERNAL_API_KEY:-}"
 export LMTPD_HOSTNAME="${SMTP_HOSTNAME:-mail.example.com}"
 export DOMAIN_MAP="${DOMAIN_MAP:-/var/spool/postfix/virtual_domains}"
 
@@ -47,8 +48,13 @@ cat > /usr/local/bin/sync-domains.sh << 'SCRIPT'
 set -e
 
 API_URL="${API_URL:-http://api:8080}"
+INTERNAL_API_KEY="${INTERNAL_API_KEY:-}"
 DOMAIN_MAP="${DOMAIN_MAP:-/var/spool/postfix/virtual_domains}"
-DOMAINS=$(curl -sf --connect-timeout 5 --max-time 15 "$API_URL/internal/domains" 2>/dev/null || echo "")
+CURL_ARGS=(-sf --connect-timeout 5 --max-time 15)
+if [ -n "$INTERNAL_API_KEY" ]; then
+    CURL_ARGS+=(-H "X-Internal-Key: $INTERNAL_API_KEY")
+fi
+DOMAINS=$(curl "${CURL_ARGS[@]}" "$API_URL/internal/domains" 2>/dev/null || echo "")
 if [ -n "$DOMAINS" ]; then
     if echo "$DOMAINS" | python3 -c '
 import json

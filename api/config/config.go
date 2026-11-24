@@ -34,6 +34,9 @@ type Config struct {
 	GitHubClientID       string
 	GitHubClientSecret   string
 	GitHubRedirectURL    string
+	// InternalAPIKey 保护 /internal/* 接口（X-Internal-Key 头）。
+	// 为空时 /internal/* 仅允许回环/私有网段的直连对端访问。
+	InternalAPIKey string
 }
 
 func Load() *Config {
@@ -81,6 +84,7 @@ func Load() *Config {
 		GitHubClientID:      os.Getenv("GITHUB_CLIENT_ID"),
 		GitHubClientSecret:  os.Getenv("GITHUB_CLIENT_SECRET"),
 		GitHubRedirectURL:   os.Getenv("GITHUB_REDIRECT_URL"),
+		InternalAPIKey:      os.Getenv("INTERNAL_API_KEY"),
 	}
 }
 

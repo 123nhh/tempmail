@@ -32,9 +32,19 @@ func (h *RegisterHandler) Register(c *gin.Context) {
 		return
 	}
 
-	account, err := h.store.CreateAccount(c.Request.Context(), req.Username)
+	email, err := normalizeContactEmail(req.Email)
 	if err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "username already exists"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid email address"})
+		return
+	}
+
+	account, err := h.store.CreateAccountWithEmail(c.Request.Context(), req.Username, email)
+	if err != nil {
+		if isUniqueViolation(err) {
+			c.JSON(http.StatusConflict, gin.H{"error": "username already exists"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create account"})
 		return
 	}
 
@@ -42,6 +52,7 @@ func (h *RegisterHandler) Register(c *gin.Context) {
 		"id":       account.ID,
 		"username": account.Username,
 		"api_key":  account.APIKey,
+		"email":    account.Email,
 		"message":  "registration successful — save your API key, it won't be shown again",
 	})
 }

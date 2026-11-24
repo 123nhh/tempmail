@@ -3,6 +3,7 @@ package handler
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -116,6 +117,10 @@ func (h *GitHubHandler) Callback(c *gin.Context) {
 	username := gitHubUsername(profile)
 	account, err := h.store.GetOrCreateGitHubAccount(c.Request.Context(), gitHubID, username)
 	if err != nil {
+		if errors.Is(err, store.ErrAccountDisabled) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "account is disabled"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -125,6 +130,7 @@ func (h *GitHubHandler) Callback(c *gin.Context) {
 		"id":         account.ID,
 		"username":   account.Username,
 		"is_admin":   account.IsAdmin,
+		"email":      account.Email,
 		"created_at": account.CreatedAt,
 	})
 	c.Header("Content-Type", "text/html; charset=utf-8")

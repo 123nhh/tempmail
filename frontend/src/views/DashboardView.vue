@@ -97,10 +97,16 @@ const pool = computed(() => {
 })
 
 // ─── 数据加载 ───
+// 邮箱、域名、统计、最近邮件并行请求，一个往返完成看板加载
 async function load() {
   loading.value = true
   try {
-    const [mb, dm, st] = await Promise.all([api.listMailboxes(), api.domains(), api.stats().catch(() => null)])
+    const [mb, dm, st] = await Promise.all([
+      api.listMailboxes(),
+      api.domains(),
+      api.stats().catch(() => null),
+      loadRecent(),
+    ])
     allMailboxes.value = mb || []
     domains.value = dm || []
     stats.value = st
@@ -109,32 +115,20 @@ async function load() {
   } finally {
     loading.value = false
   }
-  loadRecent()
 }
 
-// 最近邮件：取最近创建的 5 个邮箱，合并后按收件时间倒序
+// 最近邮件：后端一次性返回当前账户全部活跃邮箱的最新邮件（按收件时间倒序）
+const recentMailboxId = e => e.mailbox_id ?? e.mailbox?.id
+const recentAddress = e => e.mailbox_address || e.mailbox?.full_address || ''
 async function loadRecent() {
-  const boxes = [...mailboxes.value]
-    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-    .slice(0, 5)
-  if (!boxes.length) {
-    recent.value = []
-    return
-  }
   recentLoading.value = true
   try {
-    const lists = await Promise.all(
-      boxes.map(mb =>
-        api
-          .listEmails(mb.id)
-          .then(es => (es || []).map(e => ({ ...e, mailbox: mb, otp: extractOtp({ subject: e.subject }) })))
-          .catch(() => []),
-      ),
-    )
-    recent.value = lists
-      .flat()
-      .sort((a, b) => new Date(b.received_at) - new Date(a.received_at))
-      .slice(0, 8)
+    const list = await api.recentEmails(8)
+    recent.value = (list || [])
+      .filter(e => recentMailboxId(e) != null)
+      .map(e => ({ ...e, otp: extractOtp({ subject: e.subject }) }))
+  } catch {
+    recent.value = []
   } finally {
     recentLoading.value = false
   }
@@ -144,7 +138,7 @@ function openBox(mb) {
   router.push({ name: 'mailbox', params: { id: mb.id } })
 }
 function openEmail(e) {
-  router.push({ name: 'mailbox', params: { id: e.mailbox.id, emailId: e.id } })
+  router.push({ name: 'mailbox', params: { id: recentMailboxId(e), emailId: e.id } })
 }
 
 watch(() => mailboxBus.version, load)
@@ -237,7 +231,7 @@ onMounted(load)
     <section class="card span-2" aria-labelledby="h-recent">
       <div class="card-h">
         <h2 id="h-recent"><MailOpen aria-hidden="true" />最近邮件</h2>
-        <span class="sub">来自最近创建的 5 个邮箱</span>
+        <span class="sub">来自全部活跃邮箱</span>
       </div>
       <SkeletonRows v-if="loading || (recentLoading && !recent.length)" :rows="3" :cols="3" />
       <EmptyState v-else-if="!recent.length" :icon="MailOpen">
@@ -248,13 +242,13 @@ onMounted(load)
           <div class="m-main">
             <span class="m-from ellipsis">{{ senderName(e.sender) }}</span>
             <RouterLink
-              :to="{ name: 'mailbox', params: { id: e.mailbox.id, emailId: e.id } }"
+              :to="{ name: 'mailbox', params: { id: recentMailboxId(e), emailId: e.id } }"
               class="m-subj ellipsis"
               @click.stop
             >
               {{ e.subject || '(无主题)' }}
             </RouterLink>
-            <span class="m-to ellipsis small muted">{{ e.mailbox.full_address }}</span>
+            <span class="m-to ellipsis small muted">{{ recentAddress(e) }}</span>
           </div>
           <div class="m-side">
             <button

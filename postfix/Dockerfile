@@ -1,8 +1,10 @@
 FROM golang:1.23-alpine AS receiver-builder
 
 WORKDIR /build
+COPY postfix/go.mod postfix/go.sum ./
+RUN go mod download
 COPY postfix/mail-receiver-lmtpd.go .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /build/mail-receiver mail-receiver-lmtpd.go
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /build/mail-receiver .
 
 # ============================================================
 # Postfix 收件容器

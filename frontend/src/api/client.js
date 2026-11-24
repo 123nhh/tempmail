@@ -65,7 +65,13 @@ export const api = {
   createMailbox: body => request(`${API_BASE}/mailboxes`, { method: 'POST', body: body || {} }).then(d => d.mailbox || d),
   getMailbox: id => request(`${API_BASE}/mailboxes/${encodeURIComponent(id)}`).then(d => d.mailbox || d),
   listMailboxes: () => request(`${API_BASE}/mailboxes?size=100`).then(list),
-  listMailboxesPage: (page = 1, size = 100) => request(`${API_BASE}/mailboxes?page=${page}&size=${size}`),
+  // 分页列表：可选 q（按地址模糊搜索）与 sort（expiry 到期优先 / new 最新创建）
+  listMailboxesPage: (page = 1, size = 100, { q = '', sort = '' } = {}) => {
+    const qs = new URLSearchParams({ page: String(page), size: String(size) })
+    if (q) qs.set('q', q)
+    if (sort) qs.set('sort', sort)
+    return request(`${API_BASE}/mailboxes?${qs}`)
+  },
   deleteMailbox: id => request(`${API_BASE}/mailboxes/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   extendMailbox: (id, minutes) =>
     request(`${API_BASE}/mailboxes/${encodeURIComponent(id)}/extend`, { method: 'POST', body: minutes ? { minutes } : {} })
@@ -73,6 +79,8 @@ export const api = {
   mailboxEvents: (id, opts) => openEventStream(`${API_BASE}/mailboxes/${encodeURIComponent(id)}/events`, opts),
 
   // 邮件
+  // 当前账户全部活跃邮箱的最近邮件（按收件时间倒序），每项带 mailbox_id / mailbox_address
+  recentEmails: (limit = 8) => request(`${API_BASE}/emails/recent?limit=${encodeURIComponent(limit)}`).then(list),
   listEmails: mid => request(`${API_BASE}/mailboxes/${encodeURIComponent(mid)}/emails?size=100`).then(list),
   getEmail: (mid, eid) =>
     request(`${API_BASE}/mailboxes/${encodeURIComponent(mid)}/emails/${encodeURIComponent(eid)}`).then(d => d.email || d),
@@ -82,7 +90,8 @@ export const api = {
   // 管理
   admin: {
     listAccounts: (page = 1, size = 10) => request(`${API_BASE}/admin/accounts?page=${page}&size=${size}`),
-    createAccount: username => request(`${API_BASE}/admin/accounts`, { method: 'POST', body: { username } }),
+    createAccount: (username, email = '') =>
+      request(`${API_BASE}/admin/accounts`, { method: 'POST', body: email ? { username, email } : { username } }),
     deleteAccount: id => request(`${API_BASE}/admin/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
     addDomain: domain => request(`${API_BASE}/admin/domains`, { method: 'POST', body: { domain } }),
     deleteDomain: id => request(`${API_BASE}/admin/domains/${encodeURIComponent(id)}`, { method: 'DELETE' }),

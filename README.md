@@ -1,32 +1,37 @@
 # TempMail
 
-一个自托管临时邮件服务平台，支持多域名、用户自助提交域名、MX 自动验证与自动禁用、API Key 鉴权及 Web 管理后台。
-部署教程可看 https://linux.do/t/topic/1667604
+一个高并发自托管临时邮件平台，基于 **PostgreSQL + PgBouncer + Redis + Go + Postfix (LMTP) + Vue 3** 构建。支持多域名与多级通配子域名、自助提交域名与 MX 自动验证、SSE 实时收件推送、验证码自动识别、完整 API Key 编程接口、OAuth 登录及现代化 Web 管理后台。
+
+- 部署教程参考：https://linux.do/t/topic/1667604
 
 ---
 
-## 功能特性
+## 核心特性
 
-| 功能 | 说明 |
+| 模块 | 说明 |
 |------|------|
-| 邮箱管理 | 按需创建临时邮箱，可配置 TTL（默认 30 分钟），自动清理 |
-| 邮箱续期 | 到期前一键续期，每次顺延一个有效期，单个邮箱最长存活 24 小时（均可在后台调整）|
-| 到期提醒 | 邮箱剩余不足 5 分钟时弹出提醒，可直接在提醒中续期 |
-| 实时收件 | 收件箱通过 SSE 实时推送新邮件，断线自动回退到轮询 |
-| 验证码识别 | 自动从主题和正文中提取验证码，点击即可复制 |
-| 多域名池 | 多个域名轮流供用户创建邮箱，管理员或普通用户均可提交新域名 |
-| MX 自动验证 | 提交域名后后台每 30 秒轮询 MX 记录，通过即自动激活，无需管理员确认 |
-| 域名健康监控 | 每 6 小时重检已激活域名，MX 失效自动暂停（`status=disabled`）|
-| IP / Hostname 分离 | 服务器 IP 与邮件主机名通过环境变量或后台设置注入，不写入代码 |
-| API Key 鉴权 | 每用户独立 API Key（`X-API-Key` 头），速率限制 500 次/分钟 |
-| OAuth 登录 | 支持 Linux DO Connect 与 GitHub OAuth 登录，可在后台独立开关 |
-| 管理后台 | Web GUI 管理账户、域名、邮件、系统配置（含 SMTP Hostname）|
-| 数据看板 | 配额、即将过期邮箱、最近邮件、域名池概况，自适应铺满宽屏 |
-| API 文档 | 内置完整接口文档，示例代码（cURL / Python / JavaScript）自动填入 Base URL 与当前 Key |
-| 界面 | Vue 3 单页应用，支持浅色 / 深色 / 跟随系统，适配桌面、平板与手机 |
-| 公告系统 | 管理员可设置公告，用户登录后显示 |
-| 速率限制 | Redis 滑动窗口，默认 500 请求/60 秒/令牌 |
-| 连接池 | PgBouncer 事务模式，支持 2000 并发客户端 |
+| **临时邮箱管理** | 按需创建随机或自定义前缀邮箱，支持服务端分页、搜索与排序；可配置有效期（默认 30 分钟）、每用户活跃上限、默认域名及自动清理 |
+| **一键续期与提醒** | 到期前自动弹出提醒并可一键续期；支持后台配置单次续期时长与单个邮箱最长存活上限（默认 24 小时） |
+| **实时收件（SSE）** | 收件箱通过 SSE 实时推送 `ready` / `email` / `mailbox` / `expired` 事件，Nginx 独立关闭缓冲并配置 300s 读超时；断线自动退避重连并回退轮询 |
+| **完整邮件解码与安全阅读** | Postfix 常驻 Go LMTP 守护进程支持 RFC 2047 邮件头、Base64 / Quoted-Printable、UTF-8 / GBK / GB18030 / GB2312 / HZ-GB-2312 / Big5 / ISO-8859-1 / Windows-1252 解码；HTML 正文通过受限 `iframe` + CSP 沙箱隔离，默认拦截远程追踪图片 |
+| **验证码自动提取** | 自动从主题与正文中识别中英文验证码，一键复制 |
+| **多域名池与多级子域** | 支持普通单域名与 `*.example.com` 多级通配子域名；自动独立检测单域/通配 MX 能力，后台每 30 秒验证待生效域名，每 6 小时健康巡检 |
+| **账号与认证** | 支持独立 API Key（`Authorization: Bearer`、`X-API-Key`、`?api_key=` 三种方式均可）、注册/创建账户附带可选联系邮箱、Linux DO Connect 与 GitHub OAuth 登录 |
+| **高并发与安全防护** | PgBouncer 事务连接池 + 内部单封投递微批 + 内存聚合计数；Redis Lua 原子固定窗口限流（账户级 + 公开入口 IP 防刷）；`/internal/*` 内部密钥鉴权 + 默认仅监听 `127.0.0.1` + 12 MiB 请求体上限 |
+| **Web 控制台与文档** | Vue 3 + Vite 单页应用，内置数据看板、浅色/深色/跟随系统主题与交互式 API 文档（自动填入 Base URL 与当前 Key，提供 cURL / Python / JavaScript 示例） |
+| **开箱即用镜像** | GitHub Actions 自动构建并推送 `tempmail-api`、`tempmail-frontend`、`tempmail-postfix` 三个 GHCR 镜像，低配服务器无需本地编译 |
+
+---
+
+## 架构概览
+
+```
+外部发件方 ──► Postfix (:25) ──(Unix LMTP)──► mail-receiver ──(HTTP + X-Internal-Key)──┐
+                                                                                        ▼
+用户浏览器 / API 客户端 ──► Nginx (:8888) ──(/api, /public, SSE)──► Go API (:8080) ──► PgBouncer (:6432) ──► PostgreSQL 16
+                                                                         │
+                                                                         └──► Redis 8（Lua 限流 & SSE Pub/Sub）
+```
 
 ---
 
@@ -34,116 +39,235 @@
 
 ### 前置条件
 
-- Docker 20.10+
-- Docker Compose v2+
-- 公网 IP / 域名（用于接收邮件）
+- Docker 20.10+ 与 Docker Compose v2+
+- 拥有公网 IP 且放行 `25` 端口（用于外部 MX 收信）和 Web 端口（默认 `8888`）
 
-### 1. 克隆并配置
+### 1. 克隆仓库并准备环境变量
 
 ```bash
 git clone https://github.com/123nhh/tempmail.git
 cd tempmail
 cp .env.example .env
-# 编辑 .env，填写 SMTP_SERVER_IP 和 SMTP_HOSTNAME
 ```
 
+编辑 `.env`，至少修改以下必填项：
+
+- `POSTGRES_PASSWORD` 与 `API_DB_DSN` 中的数据库密码（两者保持一致）
+- `REDIS_PASSWORD` 与 `API_REDIS_PASSWORD`（两者保持一致）
+- `INTERNAL_API_KEY`（建议填入高强度随机字符串，保护 `postfix` ↔ `api` 内部通信）
+- `SMTP_SERVER_IP`（服务器公网 IP）与 `SMTP_HOSTNAME`（如 `mail.yourdomain.com`）
+
 ### 2. 启动服务
+
+**方式 A：直接拉取预构建 GHCR 镜像（推荐，无需本地构建）**
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+**方式 B：本地源码构建启动**
 
 ```bash
 docker compose up -d --build
 ```
 
-六个容器会自动启动：`postgres`、`pgbouncer`、`redis`、`api`、`frontend`（Nginx）、`postfix`。
+启动后将运行 6 个容器：`postgres`、`pgbouncer`、`redis`、`api`、`frontend`（Nginx）、`postfix`，核心服务均内置 Docker `healthcheck`。
 
 ### 3. 获取管理员 API Key
 
-首次启动后，管理员 Key 会写入 `data/admin.key`：
+为避免密钥泄漏到日志系统，管理员 API Key **不会打印在容器日志中**，而是以 `0600` 权限写入宿主机 `data/admin.key`：
 
 ```bash
 cat data/admin.key
-# tm_admin_<自动生成的随机密钥>
+# ADMIN_API_KEY=tm_admin_<随机密钥>
 ```
 
-也可查看容器日志：
+### 4. 访问 Web 控制台
 
-```bash
-docker compose logs api | grep "ADMIN API KEY"
-```
+打开 `http://<服务器IP>:8888`（端口由 `FRONTEND_HOST_PORT` 控制），使用上方管理员 API Key 登录即可配置域名与系统参数。
 
-### 4. 访问 Web 界面
-
-浏览器打开 `http://<服务器IP>:8888`（端口由 `FRONTEND_HOST_PORT` 控制），在登录页输入管理员 API Key 登录。
+> 生产环境建议在前端再加一层 HTTPS 反向代理（如 Caddy / Nginx / Cloudflare），并透传 `X-Forwarded-Proto` 与 `X-Forwarded-Host`。
 
 ### 从旧版本升级
 
 ```bash
 git pull
-docker compose up -d --build
+docker compose pull
+docker compose up -d
+# 若本地修改过代码，改为：docker compose up -d --build
 ```
 
-前端改为在镜像构建阶段编译，升级后需要带 `--build` 重新构建。数据库如有未执行的迁移，参考下文「数据库迁移」。
+- 新版新增的 `accounts.email` 字段会在 API 启动时自动幂等补齐（`EnsureSchema`），无需手动改表。
+- 若从很早期的 v1–v10 数据库升级，请参考下方「数据库迁移」按顺序补齐历史脚本。
 
 ---
 
-## 环境变量
+## 环境变量说明
 
-在项目根目录 `.env` 文件中配置（**所有含服务器 IP / 域名的信息均在此处填写，不写入代码**）：
+完整模板见 [`.env.example`](./.env.example)。
+
+### 基础与安全配置
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `SMTP_SERVER_IP` | *(必填)* | 服务器公网 IP，用于 MX 验证与 SPF 生成 |
-| `SMTP_HOSTNAME` | *(推荐填写)* | 邮件服务器主机名，如 `mail.yourdomain.com`。设置后用户添加域名只需一条 MX 记录，无需 A 记录 |
-| `API_DB_DSN` | `postgres://tempmail:...@pgbouncer:6432/tempmail` | API 数据库连接串（经 PgBouncer）|
-| `API_REDIS_ADDR` | `redis:6379` | Redis 连接地址 |
-| `API_PORT` | `8080` | API 监听端口 |
-| `API_DB_MAX_CONNS` | `128` | API 到 PgBouncer 的最大客户端连接数 |
-| `API_DB_MIN_CONNS` | `16` | API 预热数据库连接数 |
-| `API_DELIVERY_BATCH_ENABLED` | `true` | 是否启用单封内部投递微批；不改变 API 路径或响应，可设为 `false` 快速回退 |
-| `API_DELIVERY_BATCH_MAX` | `64` | 单封内部投递微批的最大邮件数（允许 1–256，不改变 API 路径）|
-| `API_DELIVERY_BATCH_WAIT` | `1ms` | 收集并发单封投递的最长等待时间（允许 100µs–100ms）|
-| `PGBOUNCER_DEFAULT_POOL_SIZE` | `64` | PgBouncer 到 PostgreSQL 的常规连接数 |
-| `PGBOUNCER_RESERVE_POOL_SIZE` | `16` | PgBouncer 预留连接数 |
-| `POSTFIX_DEFAULT_PROCESS_LIMIT` | `500` | Postfix 服务默认进程上限 |
-| `POSTFIX_SMTPD_PROCESS_LIMIT` | `200` | SMTP 服务全局进程上限，避免多来源流量挤占 LMTP |
-| `POSTFIX_SMTPD_CLIENT_CONNECTION_COUNT_LIMIT` | `200` | 单来源 IP 同时 SMTP 连接上限 |
-| `POSTFIX_SMTPD_CLIENT_CONNECTION_RATE_LIMIT` | `0` | 单来源建连速率；`0` 为关闭 |
-| `POSTFIX_LMTP_DESTINATION_CONCURRENCY_LIMIT` | `128` | Postfix 到 LMTP daemon 的投递并发 |
-| `API_RATE_LIMIT` | `500` | 每令牌每窗口期最大请求数 |
-| `API_RATE_WINDOW` | `60` | 速率窗口（秒）|
-| `GITHUB_CLIENT_ID` | *(可选)* | GitHub OAuth App 的 Client ID，也可在后台系统设置中填写 |
-| `GITHUB_CLIENT_SECRET` | *(可选)* | GitHub OAuth App 的 Client Secret，也可在后台系统设置中填写 |
-| `GITHUB_REDIRECT_URL` | *(可选)* | GitHub OAuth 回调地址，如 `https://your-domain.com/public/auth/github/callback` |
-| `ADMIN_KEY_FILE` | `/data/admin.key` | 管理员 Key 写入路径（容器内）|
-| `FRONTEND_HOST_PORT` | `8888` | Web 界面映射到宿主机的端口，可写成 `127.0.0.1:8888` 仅本机访问 |
-| `API_HOST_PORT` | `8080` | API 直连端口（Web 界面已经通过 Nginx 反代，无需对外开放）|
-| `SMTP_HOST_PORT` | `25` | SMTP 收件端口，公网收信必须是 25 |
+| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | `tempmail` / `tempmail` / *(必填)* | PostgreSQL 数据库凭证 |
+| `REDIS_PASSWORD` / `API_REDIS_PASSWORD` | *(必填)* | Redis 密码（两项保持一致） |
+| `INTERNAL_API_KEY` | *(推荐填写)* | `postfix` 与 `api` 之间 `/internal/*` 接口的共享密钥（`X-Internal-Key`）；留空时仅放行 Docker 内网与回环直连 IP |
+| `API_HOST_BIND` | `127.0.0.1` | API 端口在宿主机的绑定地址；默认仅本机监听，防止外部直连 `/internal/*` |
+| `API_HOST_PORT` | `8080` | API 宿主机映射端口（Web 流量已由 Nginx 反代，生产环境通常无需对外暴露） |
+| `FRONTEND_HOST_PORT` | `8888` | Web 控制台宿主机对外端口（也可写成 `127.0.0.1:8888` 交由前置反代转发） |
+| `SMTP_HOST_PORT` | `25` | SMTP 收信端口（公网收信必须为 `25`） |
+| `SMTP_SERVER_IP` | *(必填)* | 服务器公网 IP，用于 MX 检测与 SPF 记录提示（管理后台设置优先） |
+| `SMTP_HOSTNAME` | *(推荐填写)* | 邮件服务器主机名（如 `mail.yourdomain.com`），设置后添加域名只需一条 MX 记录 |
+| `ADMIN_KEY_FILE` | `/data/admin.key` | 管理员 API Key 在容器内的落盘路径（对应宿主机 `./data/admin.key`） |
+| `DOCKER_IMAGE_NAMESPACE` / `DOCKER_IMAGE_TAG` | `123nhh` / `latest` | GHCR 镜像命名空间与标签 |
 
-`.env` 示例：
+### API、限流与连接池调优
 
-```dotenv
-SMTP_SERVER_IP=1.2.3.4
-SMTP_HOSTNAME=mail.yourdomain.com
-GITHUB_REDIRECT_URL=https://your-domain.com/public/auth/github/callback
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `API_PORT` | `8080` | Go API 容器内监听端口 |
+| `API_DB_DSN` | `postgres://...@pgbouncer:6432/tempmail?sslmode=disable` | API 数据库连接串（经 PgBouncer） |
+| `API_DB_MAX_CONNS` / `API_DB_MIN_CONNS` | `128` / `16` | API 到 PgBouncer 的连接池大小 |
+| `API_DELIVERY_BATCH_ENABLED` | `true` | 是否开启并发单封投递内部微批（不改变 HTTP 接口语义） |
+| `API_DELIVERY_BATCH_MAX` / `API_DELIVERY_BATCH_WAIT` | `64` / `1ms` | 微批上限（1–256）与最长攒批等待（100µs–100ms） |
+| `API_RATE_LIMIT` / `API_RATE_WINDOW` | `5000` / `60` | Redis Lua 固定窗口限流：每账户每窗口最大请求数与窗口秒数 |
+| `PGBOUNCER_MAX_CLIENT_CONN` | `2000` | PgBouncer 最大客户端连接数 |
+| `PGBOUNCER_DEFAULT_POOL_SIZE` / `MIN` / `RESERVE` | `64` / `16` / `16` | PgBouncer 到 PostgreSQL 的连接池参数 |
+| `POSTFIX_DEFAULT_PROCESS_LIMIT` / `SMTPD_PROCESS_LIMIT` | `500` / `200` | Postfix 默认进程上限与入站 `smtpd` 独立上限 |
+| `POSTFIX_LMTP_DESTINATION_CONCURRENCY_LIMIT` | `128` | Postfix → LMTP daemon 并发度 |
+| `LMTP_HTTP_MAX_IDLE_CONNS` / `PER_HOST` / `MAX_CONNS_PER_HOST` | `512` / `256` / `512` | LMTP daemon 到 API 的 HTTP 连接池参数 |
+
+### OAuth 配置（可选，亦可在管理后台动态填写）
+
+| 变量 | 说明 |
+|------|------|
+| `LINUXDO_CLIENT_ID` / `LINUXDO_CLIENT_SECRET` / `LINUXDO_REDIRECT_URL` | Linux DO Connect 应用配置，回调地址示例：`https://your-domain.com/public/auth/linuxdo/callback` |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` / `GITHUB_REDIRECT_URL` | GitHub OAuth App 配置，回调地址示例：`https://your-domain.com/public/auth/github/callback` |
+
+> 系统动态设置（`mailbox_ttl_minutes`、`mailbox_extend_minutes`、`mailbox_max_lifetime_minutes`、`max_mailboxes_per_user`、`default_domain`、`site_title`、`site_logo_url`、`announcement`、登录/注册开关等）均可在管理后台「系统设置」页实时修改并生效。
+
+---
+
+## 添加邮件域名与 DNS 配置
+
+任意已登录用户均可自助提交域名；管理员也可以在后台直接添加或强制导入。
+
+### 推荐配置（已设置 `SMTP_HOSTNAME`，例如 `mail.yourdomain.com`）
+
+确保 `mail.yourdomain.com` 已有指向服务器公网 IP 的 `A` 记录，然后为业务域名添加：
+
+```text
+# 仅单域名邮箱（user@example.com）
+MX   @   mail.yourdomain.com   优先级 10
+TXT  @   v=spf1 ip4:<服务器IP> ~all
+
+# 如需支持多级通配子域邮箱（user@a.b.c.example.com），额外添加：
+MX   *   mail.yourdomain.com   优先级 10
 ```
 
-> `SMTP_SERVER_IP` / `SMTP_HOSTNAME` 也可在管理后台「系统设置」中修改，DB 值优先于环境变量。
-> 邮箱有效期相关的后台设置：`mailbox_ttl_minutes`（新邮箱有效期）、`mailbox_extend_minutes`（每次续期时长，留空则等于有效期）、`mailbox_max_lifetime_minutes`（单个邮箱最长存活，默认 1440，`0` 为不限）。
-> GitHub 登录需要在 GitHub OAuth App 中把 Authorization callback URL 设置为 `/public/auth/github/callback` 对应的完整公网地址，并在后台开启「GitHub 登录」。
+> 若未配置 `SMTP_HOSTNAME`，还需为每个域名单独添加 `A` 记录 `mail -> <服务器公网IP>` 并把 MX 指向 `mail.example.com`。
 
-### 吞吐压测
+### 创建邮箱的域名与模式选择规则
 
-仓库提供两个只使用现有调用路径的压测命令：
+- **显式指定 `mode`**（`single` 或 `multi`）：按指定模式选取支持对应 MX 能力的活跃域名。
+- **指定了 `domain` 或 `domain_id` 但未传 `mode`**：优先使用该域名的单域名能力，仅支持通配时自动使用 `multi`。
+- **未指定域名且未传 `mode`**：优先尝试后台配置的 `default_domain`；否则在单域名与多级子域之间 50/50 随机选择，并在缺少对应能力域名时自动回退到可用类型。
+
+---
+
+## API 使用指南
+
+所有 `/api/*` 接口均需认证，支持以下**三种方式**（长期保持兼容，只增不减）：
+
+```text
+Authorization: Bearer tm_xxxxxxxxxxxx
+X-API-Key: tm_xxxxxxxxxxxx
+?api_key=tm_xxxxxxxxxxxx
+```
+
+错误响应统一返回 `{"error": "..."}`。登录后在 Web 控制台「API 文档」页可查看全部接口参数、错误码与一键复制的 cURL / Python / JavaScript 代码。
+
+### 常用接口示例
+
+```bash
+BASE="http://<服务器IP>:8888"
+KEY="your_api_key"
+
+# 1. 公开注册（需后台开启注册；email 为可选联系邮箱）
+curl -X POST "$BASE/public/register" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","email":"alice@example.org"}'
+
+# 2. 获取公开站点配置 / 平台统计
+curl "$BASE/public/settings"
+curl "$BASE/public/stats"
+
+# 3. 获取当前账户信息 & 可用域名
+curl "$BASE/api/me" -H "Authorization: Bearer $KEY"
+curl "$BASE/api/domains" -H "Authorization: Bearer $KEY"
+
+# 4. 创建临时邮箱（字段全可选）
+curl -X POST "$BASE/api/mailboxes" \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"single","address":"mytest","domain":"example.com"}'
+
+# 5. 邮箱列表（支持服务端分页、关键词搜索 q、排序 sort=expiry|new）
+curl "$BASE/api/mailboxes?page=1&size=20&q=mytest&sort=expiry" \
+  -H "Authorization: Bearer $KEY"
+
+# 6. 查询单个活跃邮箱详情 / 续期 / 删除
+curl "$BASE/api/mailboxes/<mailbox-id>" -H "Authorization: Bearer $KEY"
+curl -X POST "$BASE/api/mailboxes/<mailbox-id>/extend" \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"minutes":30}'
+curl -X DELETE "$BASE/api/mailboxes/<mailbox-id>" -H "Authorization: Bearer $KEY"
+
+# 7. 跨邮箱最近邮件 / 单邮箱邮件列表 / 读取完整邮件
+curl "$BASE/api/emails/recent?limit=8" -H "Authorization: Bearer $KEY"
+curl "$BASE/api/mailboxes/<mailbox-id>/emails" -H "Authorization: Bearer $KEY"
+curl "$BASE/api/mailboxes/<mailbox-id>/emails/<email-id>" -H "Authorization: Bearer $KEY"
+
+# 8. SSE 实时监听新邮件（事件：ready / email / mailbox / expired）
+curl -N "$BASE/api/mailboxes/<mailbox-id>/events" -H "Authorization: Bearer $KEY"
+
+# 9. 自助提交域名做 MX 自动验证 / 查询验证状态
+curl -X POST "$BASE/api/domains/submit" \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"domain":"example.com"}'
+curl "$BASE/api/domains/<domain-id>/status" -H "Authorization: Bearer $KEY"
+```
+
+### 限流响应头
+
+```http
+X-RateLimit-Limit: 5000
+X-RateLimit-Remaining: 4999
+X-RateLimit-Reset: 1735000000
+Retry-After: 42        # 仅在触发 429 时返回
+```
+
+---
+
+## 吞吐压测
+
+仓库内置两个基于现有真实链路的压测工具（位于 `api/cmd/`）：
 
 ```bash
 cd api
 
-# API → PgBouncer → PostgreSQL；响应成功代表事务已提交
+# 1. 直接压测 API → PgBouncer → PostgreSQL（配置了 INTERNAL_API_KEY 时传入 -internal-key）
 go run ./cmd/deliverbench \
   -url http://127.0.0.1:8080 \
+  -internal-key "$INTERNAL_API_KEY" \
   -recipient mailbox@example.com \
   -requests 30000 -concurrency 128 -raw-bytes 1024
 
-# SMTP → Postfix queue → LMTP → 原 internal API → PostgreSQL
+# 2. 端到端压测 SMTP → Postfix → LMTP → API → PostgreSQL
 go run ./cmd/smtpbench \
   -addr 127.0.0.1:25 \
   -recipient mailbox@example.com \
@@ -151,182 +275,27 @@ go run ./cmd/smtpbench \
   -database-dsn "$BENCH_DATABASE_DSN"
 ```
 
-`BENCH_DATABASE_DSN` 必须是压测进程可访问的 PostgreSQL/PgBouncer 地址。SMTP 端到端测试应使用没有其他流量的专用邮箱，并在开始前确认队列为空；发送完成后先等待 `postqueue -p` 为空，再确认该邮箱的数据库增量精确等于 `accepted`。未传 `-database-dsn` 且未设置 `BENCH_DATABASE_DSN` 时，命令只报告 Postfix 接收速率，不能代表最终落盘吞吐。
-
----
-
-## 添加邮件域名
-
-任意已登录用户均可提交域名，管理员可在后台直接添加。
-
-### 方式一：用户自助提交（推荐）
-
-1. 登录后进入「域名列表」→「提交域名」
-2. 填写域名，系统会展示所需 DNS 记录
-3. 在 DNS 面板完成配置后提交：
-   - **MX 已生效** → 立即激活加入域名池
-   - **MX 未生效** → 进入待验证队列，后台每 30 秒自动重试，通过后自动激活
-
-### 方式二：管理员直接添加
-
-登录管理后台 → 域名管理 → 手动添加（跳过 MX 检测，立即激活）。
-
-### 所需 DNS 记录
-
-**已配置 `SMTP_HOSTNAME`（推荐）**——仅需 2 条记录：
-
-```
-MX   @   mail.yourdomain.com   优先级 10
-TXT  @   v=spf1 ip4:<服务器IP> ~all
-```
-
-> `mail.yourdomain.com` 为 `SMTP_HOSTNAME` 的值，A 记录由该主机名自身提供，用户域名无需额外 A 记录。
-
-**未配置 `SMTP_HOSTNAME`**——需 3 条记录：
-
-```
-MX   @              mail.example.com   优先级 10
-A    mail           <服务器公网 IP>
-TXT  @              v=spf1 ip4:<服务器公网 IP> ~all
-```
-
-### 多级子域名邮箱
-
-如需生成并接收类似 `user@gmail.outlook.mail.com.net.example.com` 的多级子域邮箱，请提交通配域名：
-
-```
-*.example.com
-```
-
-DNS 需要能覆盖多层通配子域。已配置 `SMTP_HOSTNAME` 时推荐：
-
-```
-MX   *   mail.yourdomain.com   优先级 10
-TXT  *   v=spf1 ip4:<服务器IP> ~all
-```
-
-未配置 `SMTP_HOSTNAME` 时：
-
-```
-MX   *      mail.example.com   优先级 10
-A    mail   <服务器公网 IP>
-TXT  *      v=spf1 ip4:<服务器公网 IP> ~all
-```
-
-说明：
-
-- 前端新建邮箱默认使用普通单级域名，即 `mode=single`。
-- API 新建邮箱未传 `mode` 时优先使用多级域名；如果没有已激活的 `*.example.com` 通配域名，会自动回退到普通单级域名，兼容旧调用。
-- 如需 API 创建普通邮箱，请显式传 `{"mode":"single"}`。
-- 提交后系统会用类似 `mx-check.gmail.outlook.mail.com.net.example.com` 的多级主机名验证 MX 是否已经覆盖多层子域。
-
----
-
-## API 使用
-
-所有 `/api/*` 请求需要携带 API Key，以下三种方式任选其一：
-
-```
-Authorization: Bearer tm_xxxxxxxxxxxx
-X-API-Key: tm_xxxxxxxxxxxx
-?api_key=tm_xxxxxxxxxxxx
-```
-
-出错时统一返回 `{"error": "..."}`。登录后在 Web 界面的「API 文档」页可以查看全部接口的参数、响应示例和可直接运行的代码。
-
-### 常用接口
-
-```bash
-BASE="http://<服务器IP>:8888"
-KEY="your_api_key"
-
-# 获取可用域名
-curl "$BASE/api/domains" -H "Authorization: Bearer $KEY"
-
-# 获取公开设置（无需登录）
-curl "$BASE/public/settings"
-
-# 创建邮箱（随机生成普通单域名或 10-14 级多级域名邮箱；缺少对应域名类型时自动回退）
-curl -X POST "$BASE/api/mailboxes" \
-  -H "Authorization: Bearer $KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"address":"test"}'
-
-# 创建普通单级域名邮箱
-curl -X POST "$BASE/api/mailboxes" \
-  -H "Authorization: Bearer $KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"mode":"single","address":"test","domain":"mail.example.com"}'
-
-# 指定通配基础域名创建多级域名邮箱
-curl -X POST "$BASE/api/mailboxes" \
-  -H "Authorization: Bearer $KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"mode":"multi","address":"test","domain":"example.com"}'
-
-# 列出邮箱
-curl "$BASE/api/mailboxes" -H "Authorization: Bearer $KEY"
-
-# 读取邮件
-curl "$BASE/api/mailboxes/<mailbox-id>/emails" -H "Authorization: Bearer $KEY"
-
-# 邮箱续期（请求体可省略，默认顺延一个有效期；超过最长存活时间返回 409）
-curl -X POST "$BASE/api/mailboxes/<mailbox-id>/extend" \
-  -H "Authorization: Bearer $KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"minutes":30}'
-
-# 实时订阅新邮件（SSE）：事件 ready / email / mailbox / expired
-curl -N "$BASE/api/mailboxes/<mailbox-id>/events" -H "Authorization: Bearer $KEY"
-
-# 提交域名（任意登录用户）
-curl -X POST "$BASE/api/domains/submit" \
-  -H "Authorization: Bearer $KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"domain":"example.com"}'
-
-# 提交通配域名（多级邮箱）
-curl -X POST "$BASE/api/domains/submit" \
-  -H "Authorization: Bearer $KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"domain":"*.example.com"}'
-
-# 查询域名验证状态
-curl "$BASE/api/domains/<domain-id>/status" -H "Authorization: Bearer $KEY"
-
-# 获取统计（无需登录）
-curl "$BASE/public/stats"
-```
-
-### 速率限制响应头
-
-每个响应会返回：
-
-```
-X-RateLimit-Limit: 500
-X-RateLimit-Remaining: 499
-X-RateLimit-Reset: 1735000000
-```
-
 ---
 
 ## 数据库迁移
 
-| 文件 | 用途 |
-|------|------|
-| `sql/init.sql` | 全量初始化（新库使用）|
-| `sql/migrate_v2.sql` | v1 → v2：添加邮箱 `expires_at` 字段 |
-| `sql/migrate_v3.sql` | v2 → v3：域名 `status`、`mx_checked_at`，新增系统配置项（含 `smtp_hostname`）|
-| `sql/migrate_v4.sql` | v3 → v4：Linux DO Connect 登录与登录方式开关 |
-| `sql/migrate_v5.sql` | v4 → v5：累计收件统计 |
-| `sql/migrate_v6.sql` | v5 → v6：账户收件统计 |
-| `sql/migrate_v7.sql` | v6 → v7：自定义站点 Logo |
-| `sql/migrate_v8.sql` | v7 → v8：多级/通配域名支持 |
-| `sql/migrate_v9.sql` | v8 → v9：GitHub OAuth 登录 |
-| `sql/migrate_v10.sql` | v9 → v10：分别跟踪单域名与通配子域名能力 |
-| `sql/migrate_v11.sql` | v10 → v11：邮箱累计收件数扩展为 BIGINT |
+新部署直接由 PostgreSQL 自动执行 [`sql/init.sql`](./sql/init.sql)。老库升级时，`accounts.email` 会由 API 启动时自动幂等添加；若跳过较早版本，按序执行对应历史迁移脚本即可：
 
-对已运行的库按版本顺序执行尚未应用的迁移。例如从 v10 升级：
+| 脚本 | 变更内容 |
+|------|----------|
+| `sql/init.sql` | 全量初始化（新库自动执行） |
+| `sql/migrate_v2.sql` | 邮箱 `expires_at` 字段 |
+| `sql/migrate_v3.sql` | 域名 `status`、`mx_checked_at` 与系统配置项（含 `smtp_hostname`） |
+| `sql/migrate_v4.sql` | Linux DO Connect 登录与登录方式开关 |
+| `sql/migrate_v5.sql` | 平台累计收件统计 |
+| `sql/migrate_v6.sql` | 账户收件统计 |
+| `sql/migrate_v7.sql` | 自定义站点 Logo |
+| `sql/migrate_v8.sql` | 多级/通配域名支持 |
+| `sql/migrate_v9.sql` | GitHub OAuth 登录 |
+| `sql/migrate_v10.sql` | 独立跟踪单域名与通配子域名能力 |
+| `sql/migrate_v11.sql` | 邮箱累计收件数扩展为 `BIGINT` |
+
+执行示例：
 
 ```bash
 docker exec -i $(docker compose ps -q postgres) \
@@ -335,58 +304,60 @@ docker exec -i $(docker compose ps -q postgres) \
 
 ---
 
-## 项目结构
+## 本地开发与项目结构
 
-```
+```text
 tempmail/
-├── api/                  # Go API 服务
-│   ├── main.go           # 路由、中间件、后台 goroutine
-│   ├── config/           # 环境变量配置
-│   ├── handler/          # HTTP 处理器
-│   ├── middleware/        # 鉴权、速率限制
-│   ├── model/            # 数据结构
-│   └── store/            # 数据库操作
-├── frontend/             # Vue 3 + Vite 前端（构建后由 Nginx 托管）
-│   ├── src/views/        # 页面：看板、邮箱、收件箱、域名、API 文档、管理后台
-│   ├── src/components/   # 组件
-│   ├── src/docs/         # API 文档数据源
-│   └── Dockerfile        # 多阶段构建：node 编译 → nginx 托管
-├── nginx/                # Nginx 反向代理配置
-├── postfix/              # Postfix 邮件接收
-├── pgbouncer/            # PgBouncer 连接池配置
-├── sql/                  # 数据库 DDL 与迁移脚本
-├── data/                 # 运行时数据（admin.key 在此，已 gitignore）
-├── docker-compose.yml
-└── .env                  # 敏感配置（已 gitignore，不含硬编码 IP）
+├── api/                  # Go API 服务（Gin + pgx/v5 + go-redis）
+│   ├── main.go           # 路由、内部鉴权、限流、后台任务与优雅停机
+│   ├── config/           # 环境变量配置加载
+│   ├── handler/          # HTTP 接口处理器与单元测试
+│   ├── middleware/       # API Key 认证与 Redis Lua 固定窗口限流
+│   ├── realtime/         # Redis Pub/Sub + 有界异步 SSE Hub
+│   ├── model/            # 数据模型与请求/响应结构
+│   ├── store/            # PostgreSQL 存取、微批投递与统计聚合
+│   └── cmd/              # deliverbench / smtpbench 压测工具
+├── frontend/             # Vue 3 + Vite + Pinia 前端
+│   ├── src/              # 页面、组件、API 客户端与内置文档数据源
+│   ├── test/             # 前端单元测试（node --test）
+│   └── Dockerfile        # 多阶段构建（Node 22 → Nginx Alpine）
+├── postfix/              # Postfix 配置、入口脚本与 Go LMTP 守护进程（支持中文编码）
+├── nginx/                # Nginx 反向代理与 SSE 专用配置
+├── pgbouncer/            # PgBouncer 事务模式连接池配置
+├── sql/                  # 初始化 DDL 与历史迁移脚本
+├── .github/workflows/    # GitHub Actions 多镜像 GHCR 自动构建
+├── docker-compose.yml    # 完整编排（含 healthcheck 与安全端口绑定）
+└── .env.example          # 环境变量模板
 ```
 
----
-
-## 前端开发
-
-前端位于 `frontend/`，使用 Vue 3 + Vite，需 Node.js 20.19+。
+### 本地开发与测试命令
 
 ```bash
+# 后端测试
+cd api && go vet ./... && go test -race ./...
+
+# Postfix LMTP 守护进程测试
+cd postfix && go vet ./... && go test -race ./...
+
+# 前端开发、测试与构建（Node.js 20.19+）
 cd frontend
 npm ci
-npm run dev          # http://localhost:5173，/api 与 /public 代理到 localhost:8080
-# 后端不在本机时：VITE_API_TARGET=http://<服务器IP>:8080 npm run dev
-npm run build        # 产物输出到 frontend/dist
+npm run dev          # http://localhost:5173（/api 与 /public 代理到 localhost:8080）
+node --test test/otp.test.js
+npm run build
 ```
-
-`docker compose up -d --build` 会在镜像构建阶段自动编译前端，无需在宿主机安装 Node.js。
-修改前端代码后需重新执行 `docker compose up -d --build frontend`。
 
 ---
 
-## 后台 Goroutine
+## 后台任务
 
-| Goroutine | 间隔 | 功能 |
-|-----------|------|------|
-| 邮箱清理器 | 1 分钟 | 删除 `expires_at` 已过期的邮箱及其邮件 |
-| MX 域名验证器（待验证） | 30 秒 | 轮询 `status='pending'` 的域名，MX 检测通过则自动激活 |
-| MX 域名健康巡检（已激活） | 6 小时 | 重检所有 `status='active'` 的域名，MX 失效则自动禁用 |
-| Admin Key 写入 | 启动 1 秒后执行一次 | 将管理员 API Key 写入 `ADMIN_KEY_FILE` |
+| 任务 | 周期 | 职责 |
+|------|------|------|
+| 邮箱过期清理 | 每 1 分钟 | 删除 `expires_at` 已过期的邮箱及级联邮件 |
+| 统计计数落盘 | 每 1 秒 | 将内存聚合的收件计数批量写回 PostgreSQL |
+| 待验证域名 MX 检测 | 每 30 秒 | 轮询 `status='pending'` 域名，通过即自动激活 |
+| 活跃域名健康巡检 | 每 6 小时 | 重检已激活域名，MX 失效自动暂停（`disabled`） |
+| Admin Key 落盘 | 启动后 1 秒 | 写入 `ADMIN_KEY_FILE`（`0600` 权限，不打印至日志） |
 
 ---
 

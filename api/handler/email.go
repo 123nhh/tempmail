@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"tempmail/middleware"
+	"tempmail/model"
 	"tempmail/store"
 
 	"github.com/gin-gonic/gin"
@@ -36,8 +37,12 @@ func (h *EmailHandler) List(c *gin.Context) {
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	size, _ := strconv.Atoi(c.DefaultQuery("size", "20"))
-	if page < 1 { page = 1 }
-	if size < 1 || size > 100 { size = 20 }
+	if page < 1 {
+		page = 1
+	}
+	if size < 1 || size > 100 {
+		size = 20
+	}
 
 	emails, total, err := h.store.ListEmails(c.Request.Context(), mailboxID, page, size)
 	if err != nil {
@@ -51,6 +56,30 @@ func (h *EmailHandler) List(c *gin.Context) {
 		"page":  page,
 		"size":  size,
 	})
+}
+
+// GET /api/emails/recent?limit=8 - 当前账号所有活跃邮箱中最近收到的邮件（limit 1..50）
+func (h *EmailHandler) Recent(c *gin.Context) {
+	account := middleware.GetAccount(c)
+	limit, err := strconv.Atoi(c.DefaultQuery("limit", "8"))
+	if err != nil {
+		limit = 8
+	}
+	if limit < 1 {
+		limit = 1
+	} else if limit > 50 {
+		limit = 50
+	}
+
+	emails, err := h.store.ListRecentEmailsByAccount(c.Request.Context(), account.ID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if emails == nil {
+		emails = []model.RecentEmail{}
+	}
+	c.JSON(http.StatusOK, gin.H{"data": emails})
 }
 
 // GET /api/mailboxes/:mailbox_id/emails/:id - 读取邮件内容

@@ -49,6 +49,7 @@ func (h *AccountHandler) KeyLogin(c *gin.Context) {
 		"id":         account.ID,
 		"username":   account.Username,
 		"is_admin":   account.IsAdmin,
+		"email":      account.Email,
 		"created_at": account.CreatedAt,
 	})
 }
@@ -61,9 +62,19 @@ func (h *AccountHandler) Create(c *gin.Context) {
 		return
 	}
 
-	account, err := h.store.CreateAccount(c.Request.Context(), req.Username)
+	email, err := normalizeContactEmail(req.Email)
 	if err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "username already exists or db error: " + err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid email address"})
+		return
+	}
+
+	account, err := h.store.CreateAccountWithEmail(c.Request.Context(), req.Username, email)
+	if err != nil {
+		if isUniqueViolation(err) {
+			c.JSON(http.StatusConflict, gin.H{"error": "username already exists or db error: " + err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -71,6 +82,7 @@ func (h *AccountHandler) Create(c *gin.Context) {
 		"id":       account.ID,
 		"username": account.Username,
 		"api_key":  account.APIKey,
+		"email":    account.Email,
 	})
 }
 
@@ -134,6 +146,7 @@ func (h *AccountHandler) Me(c *gin.Context) {
 		"id":         account.ID,
 		"username":   account.Username,
 		"is_admin":   account.IsAdmin,
+		"email":      account.Email,
 		"created_at": account.CreatedAt,
 	})
 }

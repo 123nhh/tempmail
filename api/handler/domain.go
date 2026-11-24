@@ -205,10 +205,20 @@ func (h *DomainHandler) MXImport(c *gin.Context) {
 		return
 	}
 
+	// force 导入且 MX 未通过：按域名形态推导能力，确保域名真正以激活状态进入域名池
+	if !matched && req.Force {
+		_, domainType, _ := store.NormalizeDomain(req.Domain)
+		if domainType == store.DomainTypeWildcard {
+			supportsWildcard = true
+		} else {
+			supportsSingle = true
+		}
+	}
+
 	// 导入到域名池
 	domain, err := h.store.AddDomainWithCapabilities(ctx, req.Domain, supportsSingle, supportsWildcard)
 	if err != nil {
-		if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
+		if isUniqueViolation(err) {
 			c.JSON(http.StatusConflict, gin.H{"error": "域名已存在"})
 			return
 		}

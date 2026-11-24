@@ -192,7 +192,7 @@ func (h *MailboxHandler) Create(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("已达到活跃邮箱数量上限（%d）", maxPerUser)})
 			return
 		}
-		if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
+		if isUniqueViolation(err) {
 			c.JSON(http.StatusConflict, gin.H{"error": "address already taken, try again"})
 			return
 		}
@@ -233,10 +233,20 @@ func (h *MailboxHandler) List(c *gin.Context) {
 		size = 20
 	}
 
-	mailboxes, total, err := h.store.ListMailboxes(c.Request.Context(), account.ID, page, size)
+	// 可选：q 按完整地址模糊搜索；sort=expiry 按到期时间升序，默认按创建时间倒序
+	query := strings.TrimSpace(c.Query("q"))
+	if len(query) > 320 {
+		query = query[:320]
+	}
+	sortBy := strings.ToLower(strings.TrimSpace(c.Query("sort")))
+
+	mailboxes, total, err := h.store.ListMailboxesFiltered(c.Request.Context(), account.ID, page, size, query, sortBy)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+	if mailboxes == nil {
+		mailboxes = []model.Mailbox{}
 	}
 
 	c.JSON(http.StatusOK, gin.H{

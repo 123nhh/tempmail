@@ -15,6 +15,7 @@ CREATE TABLE accounts (
     api_key     VARCHAR(64)  NOT NULL UNIQUE,
     linuxdo_id  VARCHAR(128) UNIQUE,
     github_id   VARCHAR(128) UNIQUE,
+    email       VARCHAR(255) NOT NULL DEFAULT '',  -- 可选联系邮箱
     is_admin    BOOLEAN      NOT NULL DEFAULT FALSE,
     is_active   BOOLEAN      NOT NULL DEFAULT TRUE,
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),

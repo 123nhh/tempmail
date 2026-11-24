@@ -1,0 +1,15 @@
+# Local build artifacts and editor/OS cruft (keep sources, go.mod/go.sum)
+*.exe
+*.test
+*.out
+*.prof
+tempmail
+api-server
+/deliverbench
+/smtpbench
+.DS_Store
+.idea/
+.vscode/
+*.swp
+.env
+.env.*

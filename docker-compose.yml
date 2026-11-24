@@ -8,8 +8,8 @@
 # ╠══════════════╦════════════╦══════════════════════════════════╣
 # ║ 端口         ║  服务       ║ 说明                             ║
 # ╠══════════════╬════════════╬══════════════════════════════════╣
-# ║ 80  (对外)   ║ frontend   ║ 用户访问的 Web 界面                ║
-# ║ 8080(对外)   ║ api        ║ Go API（建议生产环境关闭对外）      ║
+# ║ 8888(对外)   ║ frontend   ║ 用户访问的 Web 界面                ║
+# ║ 8080(仅本机) ║ api        ║ 127.0.0.1:8080，生产环境无需对外   ║
 # ║ 25  (对外)   ║ postfix    ║ SMTP 收信，必须对外开放            ║
 # ╠══════════════╬════════════╬══════════════════════════════════╣
 # ║ 5432(内部)   ║ postgres   ║ 数据库，仅容器内互通             ║
@@ -132,7 +132,7 @@ services:
         soft: 65536
         hard: 65536
     ports:
-      - "${API_HOST_PORT:-8080}:8080"
+      - "${API_HOST_BIND:-127.0.0.1}:${API_HOST_PORT:-8080}:8080"
     volumes:
       - ./data:/data
     environment:
@@ -156,6 +156,13 @@ services:
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
       GITHUB_REDIRECT_URL: ${GITHUB_REDIRECT_URL:-}
       ADMIN_KEY_FILE: ${ADMIN_KEY_FILE:-/data/admin.key}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${API_PORT:-8080}/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
     depends_on:
       pgbouncer:
         condition: service_started
@@ -167,7 +174,7 @@ services:
   # ==================== 前端 Nginx ====================
   # Vue 前端在镜像构建时编译（frontend/Dockerfile），Nginx 配置仍从宿主机挂载
   frontend:
-    image: tempmail-frontend:local
+    image: ghcr.io/${DOCKER_IMAGE_NAMESPACE:-123nhh}/tempmail-frontend:${DOCKER_IMAGE_TAG:-latest}
     build:
       context: ./frontend
       dockerfile: Dockerfile
@@ -176,8 +183,15 @@ services:
       - "${FRONTEND_HOST_PORT:-8888}:80"
     volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     networks:
       - internal
 
@@ -200,6 +214,7 @@ services:
       DB_DSN: ${API_DB_DSN}
       SMTP_HOSTNAME: ${SMTP_HOSTNAME}
       API_URL: http://api:8080
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
       POSTFIX_DEFAULT_PROCESS_LIMIT: ${POSTFIX_DEFAULT_PROCESS_LIMIT:-500}
       POSTFIX_SMTPD_PROCESS_LIMIT: ${POSTFIX_SMTPD_PROCESS_LIMIT:-200}
       POSTFIX_SMTPD_CLIENT_CONNECTION_COUNT_LIMIT: ${POSTFIX_SMTPD_CLIENT_CONNECTION_COUNT_LIMIT:-200}
@@ -209,9 +224,17 @@ services:
       LMTP_HTTP_MAX_IDLE_CONNS: ${LMTP_HTTP_MAX_IDLE_CONNS:-512}
       LMTP_HTTP_MAX_IDLE_CONNS_PER_HOST: ${LMTP_HTTP_MAX_IDLE_CONNS_PER_HOST:-256}
       LMTP_HTTP_MAX_CONNS_PER_HOST: ${LMTP_HTTP_MAX_CONNS_PER_HOST:-512}
+    healthcheck:
+      test: ["CMD-SHELL", "postfix status >/dev/null 2>&1 && test -S /var/spool/postfix/private/mail-receiver"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     depends_on:
       pgbouncer:
         condition: service_started
+      api:
+        condition: service_healthy
     networks:
       - internal
 

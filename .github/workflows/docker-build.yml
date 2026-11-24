@@ -28,6 +28,9 @@ jobs:
           - image: tempmail-postfix
             context: .
             dockerfile: ./postfix/Dockerfile
+          - image: tempmail-frontend
+            context: ./frontend
+            dockerfile: ./frontend/Dockerfile
 
     steps:
       - name: Checkout repository
