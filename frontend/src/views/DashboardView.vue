@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
-  Plus, Inbox, Globe, Mail, Users, Hourglass, Megaphone, X, ArrowRight, Clock, CircleCheck, CirclePause, RefreshCw,
+  Plus, Inbox, Globe, Mail, Users, Hourglass, ArrowRight, Clock, CircleCheck, CirclePause, RefreshCw,
   MailOpen, KeyRound,
 } from '@lucide/vue'
 import PageHeader from '../components/ui/PageHeader.vue'
@@ -29,15 +29,6 @@ const domains = ref([])
 const stats = ref(null)
 const recent = ref([])
 const recentLoading = ref(false)
-
-const ANN_KEY = 'tm_ann_dismissed'
-const announcement = computed(() => (session.settings.announcement || '').trim())
-const dismissed = ref(localStorage.getItem(ANN_KEY) || '')
-const showAnn = computed(() => announcement.value && dismissed.value !== announcement.value)
-function dismissAnn() {
-  dismissed.value = announcement.value
-  localStorage.setItem(ANN_KEY, announcement.value)
-}
 
 // ─── 派生指标 ───
 const sortedBoxes = computed(() =>
@@ -152,12 +143,6 @@ onMounted(load)
       <button type="button" class="btn btn-primary" @click="openCreateMailbox"><Plus aria-hidden="true" />新建邮箱</button>
     </template>
   </PageHeader>
-
-  <div v-if="showAnn" class="notice" role="note">
-    <Megaphone aria-hidden="true" />
-    <span class="grow" style="white-space: pre-line">{{ announcement }}</span>
-    <button type="button" class="icon-btn icon-btn-sm" aria-label="关闭公告" @click="dismissAnn"><X aria-hidden="true" /></button>
-  </div>
 
   <!-- KPI -->
   <section class="kpis" aria-label="关键指标">

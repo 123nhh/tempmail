@@ -55,7 +55,7 @@ export const groups = [
         path: '/public/settings',
         auth: false,
         title: '获取站点公开配置',
-        desc: '返回站点名称、登录方式开关、公告以及生成 DNS 提示所需的邮件服务器信息。',
+        desc: '返回站点名称、登录方式开关以及生成 DNS 提示所需的邮件服务器信息。',
         response: {
           registration_open: true,
           key_login_enabled: true,
@@ -65,7 +65,6 @@ export const groups = [
           site_logo_url: '',
           smtp_server_ip: '203.0.113.10',
           smtp_hostname: 'mail.example.com',
-          announcement: '',
         },
       },
       {
@@ -547,7 +546,7 @@ export const groups = [
         method: 'PUT',
         path: '/api/admin/settings',
         title: '更新系统设置',
-        desc: '传入要修改的键值对（值都是字符串），未传的键保持不变。Client Secret 传空字符串表示不修改。可用的键：registration_open、key_login_enabled、linuxdo_login_enabled、github_login_enabled、linuxdo_client_id、linuxdo_client_secret、linuxdo_redirect_url、github_client_id、github_client_secret、github_redirect_url、site_title、site_logo_url、announcement、smtp_server_ip、smtp_hostname、default_domain、mailbox_ttl_minutes、mailbox_extend_minutes、mailbox_max_lifetime_minutes、max_mailboxes_per_user。',
+        desc: '传入要修改的键值对（值都是字符串），未传的键保持不变。Client Secret 传空字符串表示不修改。可用的键：registration_open、key_login_enabled、linuxdo_login_enabled、github_login_enabled、linuxdo_client_id、linuxdo_client_secret、linuxdo_redirect_url、github_client_id、github_client_secret、github_redirect_url、site_title、site_logo_url、smtp_server_ip、smtp_hostname、default_domain、mailbox_ttl_minutes、mailbox_extend_minutes、mailbox_max_lifetime_minutes、max_mailboxes_per_user。',
         body: [{ name: '<key>', type: 'string', desc: '任意可用设置键，值为字符串' }],
         example: { registration_open: 'true', mailbox_ttl_minutes: '60' },
         response: { message: 'settings updated' },

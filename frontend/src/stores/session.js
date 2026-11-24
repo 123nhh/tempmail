@@ -26,7 +26,7 @@ export const useSession = defineStore('session', {
     loggedIn: s => !!s.apiKey && !!s.account,
     isAdmin: s => !!s.account?.is_admin,
     username: s => s.account?.username || '用户',
-    siteTitle: s => s.settings.site_title || '云信邮件',
+    siteTitle: s => s.settings.site_title || 'TempMail',
     logoUrl: s => (s.settings.site_logo_url || '').trim(),
   },
   actions: {

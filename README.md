@@ -146,7 +146,7 @@ docker compose up -d
 | `LINUXDO_CLIENT_ID` / `LINUXDO_CLIENT_SECRET` / `LINUXDO_REDIRECT_URL` | Linux DO Connect 应用配置，回调地址示例：`https://your-domain.com/public/auth/linuxdo/callback` |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` / `GITHUB_REDIRECT_URL` | GitHub OAuth App 配置，回调地址示例：`https://your-domain.com/public/auth/github/callback` |
 
-> 系统动态设置（`mailbox_ttl_minutes`、`mailbox_extend_minutes`、`mailbox_max_lifetime_minutes`、`max_mailboxes_per_user`、`default_domain`、`site_title`、`site_logo_url`、`announcement`、登录/注册开关等）均可在管理后台「系统设置」页实时修改并生效。
+> 系统动态设置（`mailbox_ttl_minutes`、`mailbox_extend_minutes`、`mailbox_max_lifetime_minutes`、`max_mailboxes_per_user`、`default_domain`、`site_title`、`site_logo_url`、登录/注册开关等）均可在管理后台「系统设置」页实时修改并生效。
 
 ---
 

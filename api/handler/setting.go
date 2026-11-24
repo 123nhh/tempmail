@@ -68,7 +68,6 @@ func (h *SettingHandler) GetPublic(c *gin.Context) {
 		"site_logo_url":         all["site_logo_url"],
 		"smtp_server_ip":        all["smtp_server_ip"],
 		"smtp_hostname":         all["smtp_hostname"],
-		"announcement":          all["announcement"],
 	}
 
 	h.mu.Lock()
@@ -117,7 +116,6 @@ func (h *SettingHandler) AdminUpdate(c *gin.Context) {
 		"smtp_hostname":                true,
 		"site_title":                   true,
 		"site_logo_url":                true,
-		"announcement":                 true,
 		"default_domain":               true,
 		"mailbox_ttl_minutes":          true,
 		"mailbox_extend_minutes":       true,

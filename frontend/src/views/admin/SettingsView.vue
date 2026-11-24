@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
-import { Save, RotateCcw, Globe, LogIn, Mail, Server, Megaphone } from '@lucide/vue'
+import { Save, RotateCcw, Globe, LogIn, Mail, Server } from '@lucide/vue'
 import PageHeader from '../../components/ui/PageHeader.vue'
 import ToggleSwitch from '../../components/ui/ToggleSwitch.vue'
 import SkeletonRows from '../../components/ui/SkeletonRows.vue'
@@ -16,7 +16,7 @@ const BOOLS = ['registration_open', 'key_login_enabled', 'linuxdo_login_enabled'
 const SECRETS = ['linuxdo_client_secret', 'github_client_secret']
 const KEYS = [
   ...BOOLS,
-  'site_title', 'site_logo_url', 'announcement',
+  'site_title', 'site_logo_url',
   'mailbox_ttl_minutes', 'mailbox_extend_minutes', 'mailbox_max_lifetime_minutes', 'max_mailboxes_per_user', 'default_domain',
   'smtp_server_ip', 'smtp_hostname',
   'linuxdo_client_id', 'linuxdo_redirect_url', 'github_client_id', 'github_redirect_url',
@@ -201,15 +201,6 @@ onMounted(load)
       </div>
     </section>
 
-    <section class="card wide">
-      <div class="card-h"><h2><Megaphone aria-hidden="true" />公告</h2></div>
-      <div class="card-b field">
-        <label for="s-ann" class="sr-only">公告内容</label>
-        <textarea id="s-ann" v-model="form.announcement" class="inp" rows="3" placeholder="显示在所有用户看板顶部，留空不显示"></textarea>
-        <span class="hint">纯文本。修改内容后，之前关闭过公告的用户会重新看到。</span>
-      </div>
-    </section>
-
     <section v-for="p in [{ id: 'linuxdo', name: 'LinuxDO' }, { id: 'github', name: 'GitHub' }]" :key="p.id" class="card">
       <div class="card-h">
         <h2>{{ p.name }} OAuth</h2>
@@ -243,10 +234,8 @@ onMounted(load)
 
 <style scoped>
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
-.wide { grid-column: 1 / -1; }
 .sw-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .sw-row strong { font-size: 13px; font-weight: 500; }
 .sw-row .hint { margin-top: 2px; }
-textarea.inp { height: auto; padding: 8px 10px; resize: vertical; }
 @media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
 </style>
