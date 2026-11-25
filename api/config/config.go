@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -37,6 +38,43 @@ type Config struct {
 	// InternalAPIKey 保护 /internal/* 接口（X-Internal-Key 头）。
 	// 为空时 /internal/* 仅允许回环/私有网段的直连对端访问。
 	InternalAPIKey string
+	// TrustedProxies 允许其 X-Forwarded-For 被信任的代理 IP/CIDR（TRUSTED_PROXIES，逗号分隔）。
+	// 默认仅回环与私有网段（Docker 内网的 nginx）。前面有 CDN（如 Cloudflare）时，
+	// 需把 CDN 回源网段加进来，否则所有访客会被识别成 CDN 节点 IP 共用一个限流桶。
+	TrustedProxies []string
+	// TrustedPlatform 直接从该请求头读取客户端 IP（TRUSTED_PLATFORM）。
+	// 可填 "cloudflare"（=CF-Connecting-IP）或任意头名；为空则不启用。
+	TrustedPlatform string
+}
+
+var defaultTrustedProxies = []string{"127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
+
+func parseTrustedProxies(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return append([]string(nil), defaultTrustedProxies...)
+	}
+	return out
+}
+
+func parseTrustedPlatform(v string) string {
+	v = strings.TrimSpace(v)
+	switch strings.ToLower(v) {
+	case "":
+		return ""
+	case "cloudflare", "cf":
+		return "CF-Connecting-IP"
+	case "google", "gae", "appengine":
+		return "X-Appengine-Remote-Addr"
+	case "flyio", "fly":
+		return "Fly-Client-IP"
+	}
+	return v
 }
 
 func Load() *Config {
@@ -85,6 +123,8 @@ func Load() *Config {
 		GitHubClientSecret:  os.Getenv("GITHUB_CLIENT_SECRET"),
 		GitHubRedirectURL:   os.Getenv("GITHUB_REDIRECT_URL"),
 		InternalAPIKey:      os.Getenv("INTERNAL_API_KEY"),
+		TrustedProxies:      parseTrustedProxies(os.Getenv("TRUSTED_PROXIES")),
+		TrustedPlatform:     parseTrustedPlatform(os.Getenv("TRUSTED_PLATFORM")),
 	}
 }
 

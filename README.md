@@ -88,6 +88,8 @@ cat data/admin.key
 打开 `http://<服务器IP>:8888`（端口由 `FRONTEND_HOST_PORT` 控制），使用上方管理员 API Key 登录即可配置域名与系统参数。
 
 > 生产环境建议在前端再加一层 HTTPS 反向代理（如 Caddy / Nginx / Cloudflare），并透传 `X-Forwarded-Proto` 与 `X-Forwarded-Host`。
+>
+> 使用 Cloudflare 时请设置 `TRUSTED_PLATFORM=cloudflare`，否则同一 CF 节点后的所有访客会被识别为同一 IP，共享登录/注册限流额度。
 
 ### 从旧版本升级
 
@@ -133,6 +135,8 @@ docker compose up -d
 | `API_DELIVERY_BATCH_ENABLED` | `true` | 是否开启并发单封投递内部微批（不改变 HTTP 接口语义） |
 | `API_DELIVERY_BATCH_MAX` / `API_DELIVERY_BATCH_WAIT` | `64` / `1ms` | 微批上限（1–256）与最长攒批等待（100µs–100ms） |
 | `API_RATE_LIMIT` / `API_RATE_WINDOW` | `5000` / `60` | Redis Lua 固定窗口限流：每账户每窗口最大请求数与窗口秒数 |
+| `TRUSTED_PLATFORM` | *(空)* | 从指定请求头取客户端真实 IP；`cloudflare` 等价于 `CF-Connecting-IP`。仅在源站只接受 CDN 回源时启用，否则可被伪造 |
+| `TRUSTED_PROXIES` | 回环 + 私有网段 | 允许其 `X-Forwarded-For` 被信任的代理 IP/CIDR（逗号分隔，填写后替换默认值） |
 | `PGBOUNCER_MAX_CLIENT_CONN` | `2000` | PgBouncer 最大客户端连接数 |
 | `PGBOUNCER_DEFAULT_POOL_SIZE` / `MIN` / `RESERVE` | `64` / `16` / `16` | PgBouncer 到 PostgreSQL 的连接池参数 |
 | `POSTFIX_DEFAULT_PROCESS_LIMIT` / `SMTPD_PROCESS_LIMIT` | `500` / `200` | Postfix 默认进程上限与入站 `smtpd` 独立上限 |

@@ -157,6 +157,8 @@ services:
       GITHUB_REDIRECT_URL: ${GITHUB_REDIRECT_URL:-}
       ADMIN_KEY_FILE: ${ADMIN_KEY_FILE:-/data/admin.key}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      TRUSTED_PLATFORM: ${TRUSTED_PLATFORM:-}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${API_PORT:-8080}/health >/dev/null || exit 1"]
       interval: 10s

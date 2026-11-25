@@ -171,10 +171,59 @@ func scanAccount(row pgx.Row, a *model.Account) error {
 }
 
 // EnsureSchema 幂等地补齐新版本新增的列，便于老库平滑升级。
+//
+// 先查 information_schema，列已存在时不发 ALTER（避免每次启动都去抢 ACCESS EXCLUSIVE 锁）。
+// 需要 ALTER 时在事务内设置 lock_timeout：若表被长事务占用，ALTER 快速失败而不是
+// 在锁队列里堵住后续所有读写；随后退避重试，仍失败则返回错误由调用方终止启动。
 func (s *Store) EnsureSchema(ctx context.Context) error {
-	_, err := s.pool.Exec(ctx,
-		`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS email VARCHAR(255) NOT NULL DEFAULT ''`)
-	return err
+	const attempts = 6
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			delay := time.Duration(1<<(i-1)) * time.Second // 1s,2s,4s,8s,16s
+			log.Printf("[WARN] ensure schema attempt %d/%d failed: %v; retrying in %s", i, attempts, lastErr, delay)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+		if lastErr = s.ensureAccountEmailColumn(ctx); lastErr == nil {
+			return nil
+		}
+	}
+	return lastErr
+}
+
+func (s *Store) ensureAccountEmailColumn(ctx context.Context) error {
+	var exists bool
+	if err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = 'accounts' AND column_name = 'email')`,
+	).Scan(&exists); err != nil {
+		return fmt.Errorf("check accounts.email: %w", err)
+	}
+	if exists {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '5s'`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS email VARCHAR(255) NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("add accounts.email: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	log.Println("[OK] Added column accounts.email")
+	return nil
 }
 
 func (s *Store) GetAccountByAPIKey(ctx context.Context, apiKey string) (*model.Account, error) {

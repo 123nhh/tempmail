@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"mime/quotedprintable"
 	"net"
 	"net/http"
@@ -205,15 +208,15 @@ func encodeQuotedPrintable(t *testing.T, data []byte) string {
 
 func TestParseEmailDecodesSimplifiedChineseCharsets(t *testing.T) {
 	tests := []struct {
-		name           string
-		headerCharset  string
-		textCharset    string
-		htmlCharset    string
-		encoder        *encoding.Encoder
-		fromName       string
-		subject        string
-		textBody       string
-		htmlBody       string
+		name          string
+		headerCharset string
+		textCharset   string
+		htmlCharset   string
+		encoder       *encoding.Encoder
+		fromName      string
+		subject       string
+		textBody      string
+		htmlBody      string
 	}{
 		{
 			name:          "GBK",
@@ -457,5 +460,56 @@ func TestDeliverAndDeliverBatchInternalAPIKeyHeader(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMarshalPayloadDoesNotEscapeHTML(t *testing.T) {
+	html := strings.Repeat(`<p class="x">a &amp; b</p>`, 1000)
+	body, err := marshalPayload(deliverPayload{Recipient: "a@example.com", BodyHTML: html, Raw: html})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(body, []byte(`\u003c`)) {
+		t.Fatalf("payload still HTML-escaped")
+	}
+	// 2 份 HTML + 引号转义，膨胀应远小于默认转义时的 ~3x。
+	if got, limit := len(body), 2*len(html)*13/10; got > limit {
+		t.Fatalf("payload %d bytes, want <= %d", got, limit)
+	}
+	var back deliverPayload
+	if err := json.Unmarshal(body, &back); err != nil || back.BodyHTML != html {
+		t.Fatalf("round-trip failed: %v", err)
+	}
+}
+
+func TestDeliverMaps413ToPayloadTooLarge(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = w.Write([]byte(`{"error":"request body too large"}`))
+	}))
+	defer ts.Close()
+	srv := &server{apiURL: ts.URL, httpClient: newAPIHTTPClient()}
+
+	if err := srv.deliver(context.Background(), deliverPayload{Recipient: "a@example.com"}); !errors.Is(err, errPayloadTooLarge) {
+		t.Fatalf("deliver err = %v, want errPayloadTooLarge", err)
+	}
+	if _, err := srv.deliverBatch(context.Background(), deliverBatchPayload{Recipients: []string{"a@example.com"}}); !errors.Is(err, errPayloadTooLarge) {
+		t.Fatalf("deliverBatch err = %v, want errPayloadTooLarge", err)
+	}
+}
+
+func TestDeliverAllRepliesPermanentFailureOn413(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+	}))
+	defer ts.Close()
+	srv := &server{apiURL: ts.URL, httpClient: newAPIHTTPClient()}
+
+	var out bytes.Buffer
+	sess := &session{srv: srv, w: bufio.NewWriter(&out), recipients: []string{"a@example.com"}}
+	sess.deliverAll(context.Background(), []byte("Subject: hi\r\n\r\nbody\r\n"))
+	_ = sess.w.Flush()
+	if !strings.HasPrefix(out.String(), "552 ") {
+		t.Fatalf("reply = %q, want 552", out.String())
 	}
 }

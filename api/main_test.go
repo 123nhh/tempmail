@@ -118,3 +118,12 @@ func TestMaxBodySizeMiddleware(t *testing.T) {
 		t.Fatalf("undeclared oversized body: got %d, want 400/413", w.Code)
 	}
 }
+
+// LMTP 侧单封邮件最大 10 MiB，投递时 raw + 正文一起发送并经 JSON 转义，
+// 上限必须覆盖这种最坏情况，否则合法邮件会被 413 拒收。
+func TestInternalDeliverLimitCoversMaxMessage(t *testing.T) {
+	const maxMessageBytes = 10 << 20
+	if worst := int64(4*maxMessageBytes + 1<<20); internalDeliverMaxBodyBytes < worst {
+		t.Fatalf("internalDeliverMaxBodyBytes = %d, want >= %d", internalDeliverMaxBodyBytes, worst)
+	}
+}

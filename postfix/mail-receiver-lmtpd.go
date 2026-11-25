@@ -64,6 +64,22 @@ const (
 
 var errMessageTooLarge = errors.New("message exceeds maximum size")
 
+// errPayloadTooLarge 表示 API 以 413 拒收：同一封邮件重试也不会变小，应永久拒绝（5xx）
+// 而不是 451 让 Postfix 白白重试到 maximal_queue_lifetime 再退信。
+var errPayloadTooLarge = errors.New("api rejected payload as too large")
+
+// marshalPayload 关闭 HTML 转义：默认的 json.Marshal 会把 < > & 各转成 6 字节的 \u003c 等，
+// HTML 正文体积可膨胀数倍，容易超过 API 的请求体上限。
+func marshalPayload(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 type deliverPayload struct {
 	Recipient string `json:"recipient"`
 	Sender    string `json:"sender"`
@@ -434,6 +450,10 @@ func (s *session) deliverAll(ctx context.Context, raw []byte) {
 		})
 		if err != nil {
 			log.Printf("deliver-batch: %v", err)
+			if errors.Is(err, errPayloadTooLarge) {
+				s.writePermanentTooLarge(len(rcpts))
+				return
+			}
 			s.writeTemporaryFailures(len(rcpts))
 			return
 		}
@@ -459,10 +479,20 @@ func (s *session) deliverAll(ctx context.Context, raw []byte) {
 		}
 		if err := s.srv.deliver(ctx, payload); err != nil {
 			log.Printf("deliver %s: %v", rcpt, err)
+			if errors.Is(err, errPayloadTooLarge) {
+				s.writePermanentTooLarge(1)
+				continue
+			}
 			s.writeLine("451 4.5.0 temporary delivery failure")
 			continue
 		}
 		s.writeLine("250 2.0.0 <%s> accepted", rcpt)
+	}
+}
+
+func (s *session) writePermanentTooLarge(count int) {
+	for i := 0; i < count; i++ {
+		s.writeLine("552 5.3.4 message too large after decoding")
 	}
 }
 
@@ -508,7 +538,7 @@ func extractAddr(args string) string {
 }
 
 func (s *server) deliver(ctx context.Context, payload deliverPayload) error {
-	body, err := json.Marshal(payload)
+	body, err := marshalPayload(payload)
 	if err != nil {
 		return err
 	}
@@ -528,14 +558,18 @@ func (s *server) deliver(ctx context.Context, payload deliverPayload) error {
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		respBody, _ := readAndDrain(res.Body, 1024)
-		return fmt.Errorf("api HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(respBody)))
+		err := fmt.Errorf("api HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(respBody)))
+		if res.StatusCode == http.StatusRequestEntityTooLarge {
+			err = fmt.Errorf("%w (%d bytes): %v", errPayloadTooLarge, len(body), err)
+		}
+		return err
 	}
 	_, err = readAndDrain(res.Body, 0)
 	return err
 }
 
 func (s *server) deliverBatch(ctx context.Context, payload deliverBatchPayload) ([]batchResult, error) {
-	body, err := json.Marshal(payload)
+	body, err := marshalPayload(payload)
 	if err != nil {
 		return nil, err
 	}
@@ -558,7 +592,11 @@ func (s *server) deliverBatch(ctx context.Context, payload deliverBatchPayload) 
 		return nil, fmt.Errorf("read batch response: %w", readErr)
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, fmt.Errorf("api HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(respBody)))
+		err := fmt.Errorf("api HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(respBody)))
+		if res.StatusCode == http.StatusRequestEntityTooLarge {
+			err = fmt.Errorf("%w (%d bytes): %v", errPayloadTooLarge, len(body), err)
+		}
+		return nil, err
 	}
 	var parsed batchResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {

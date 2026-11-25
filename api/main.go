@@ -41,8 +41,9 @@ func main() {
 	defer db.Close()
 	log.Println("[OK] Database connected")
 	// 幂等补齐新版本新增的列（老库升级用，init.sql 仅在首次初始化时执行）
+	// 失败必须退出：新代码查询依赖这些列，带病启动会让所有鉴权查询报错（表现为全员 401）。
 	if err := db.EnsureSchema(ctx); err != nil {
-		log.Printf("[WARN] ensure schema failed: %v", err)
+		log.Fatalf("ensure schema failed: %v", err)
 	}
 	var deliveryBatcher *store.DeliveryBatcher
 	if cfg.DeliveryBatchEnabled {
@@ -91,8 +92,13 @@ func main() {
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{"/health"}}))
-	if err := r.SetTrustedProxies([]string{"127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}); err != nil {
-		log.Printf("[WARN] failed to set trusted proxies: %v", err)
+	if err := r.SetTrustedProxies(cfg.TrustedProxies); err != nil {
+		log.Fatalf("invalid TRUSTED_PROXIES %v: %v", cfg.TrustedProxies, err)
+	}
+	if cfg.TrustedPlatform != "" {
+		// 例如 Cloudflare 的 CF-Connecting-IP。仅当源站只能经由该平台访问时才安全，否则该头可被伪造。
+		r.TrustedPlatform = cfg.TrustedPlatform
+		log.Printf("[OK] Client IP taken from trusted platform header %s", cfg.TrustedPlatform)
 	}
 
 	// CORS：允许前端跨域访问
@@ -510,7 +516,10 @@ func main() {
 }
 
 // internalDeliverMaxBodyBytes 限制 /internal/deliver* 请求体大小，避免超大载荷耗尽内存。
-const internalDeliverMaxBodyBytes int64 = 12 << 20
+// LMTP 侧单封邮件上限 10 MiB，但一次投递会同时携带 raw、body_text、body_html，
+// 再经 JSON 转义（换行/引号等每字节膨胀 2 倍），最坏可达 ~40 MiB，故留足余量取 64 MiB。
+// 上限过小会导致合法邮件被 413 → LMTP 451 → Postfix 重试一天后退信。
+const internalDeliverMaxBodyBytes int64 = 64 << 20
 
 // internalAuthMiddleware 保护 /internal/* 接口。
 //   - internalKey 非空：要求请求头 X-Internal-Key 与之匹配（常量时间比较），否则 401。

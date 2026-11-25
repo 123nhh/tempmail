@@ -54,3 +54,22 @@ func TestDeliveryBatchLimits(t *testing.T) {
 		})
 	}
 }
+
+func TestParseTrustedProxies(t *testing.T) {
+	if got := parseTrustedProxies(""); len(got) != len(defaultTrustedProxies) {
+		t.Fatalf("empty: got %v, want defaults", got)
+	}
+	got := parseTrustedProxies(" 173.245.48.0/20 , ,10.0.0.0/8")
+	if len(got) != 2 || got[0] != "173.245.48.0/20" || got[1] != "10.0.0.0/8" {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestParseTrustedPlatform(t *testing.T) {
+	cases := map[string]string{"": "", "cloudflare": "CF-Connecting-IP", "CF": "CF-Connecting-IP", "X-Real-Client": "X-Real-Client"}
+	for in, want := range cases {
+		if got := parseTrustedPlatform(in); got != want {
+			t.Fatalf("parseTrustedPlatform(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
